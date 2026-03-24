@@ -543,6 +543,7 @@ async def rank_commits(since_ms):
             "diff": diff_text,
         })
 
+    # TODO do we want ot coagulate the commits into a single block? or rank the many commits
     def author_side_for_llm(author):
         cs = author_commits[author]
         return {
