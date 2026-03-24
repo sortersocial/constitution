@@ -6,7 +6,7 @@
 #   "uvicorn",
 #   "httpx",
 #   "tenacity",
-#   "evaleval",
+#   "evaleval>=0.2.6",
 #   "authlib",
 #   "itsdangerous",
 #   "starlette",
