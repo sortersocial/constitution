@@ -278,8 +278,8 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
     #
     # Termination: every adjacent slot in the current ranking is occupied by
     # a pair that already has at least one direct comparison result.
-    # There is exactly one logical pass; step counts position in current ranking.
-    step = 0
+    # There is exactly one logical pass; step is how far down the ranking we
+    # had to scan to find the first uncovered adjacent pair (1 = top of zip).
     while True:
         scores = rank_centrality(pairs)
         ranking = sorted(range(n), key=lambda idx: scores[idx], reverse=True)
@@ -295,14 +295,13 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
             break  # every adjacent edge has at least one LLM-reasoned result
 
         pos, a, b = target
-        step += 1
         await compare(a, b)
 
         if progress_fn:
             await progress_fn({
                 "phase": "zip",
                 "pass": 1,
-                "step": step,
+                "step": pos + 1,
                 "total": n - 1,
             })
 

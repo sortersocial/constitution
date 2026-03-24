@@ -298,8 +298,8 @@ def test_progress_reports_zip_phase():
         assert e["total"] == 2         # n-1 = 2
 
 
-def test_progress_zip_step_increases():
-    """Zip step counter increases with each comparison."""
+def test_progress_zip_step_is_position_in_ranking():
+    """step is how far down the ranking we scanned to find the first uncovered pair."""
     events = []
 
     async def progress_fn(event):
@@ -314,8 +314,8 @@ def test_progress_zip_step_increases():
 
     run(pairwise_rank(3, one_zip_cmp, progress_fn))
     zip_events = [e for e in events if e["phase"] == "zip"]
-    steps = [e["step"] for e in zip_events]
-    assert steps == list(range(1, len(steps) + 1))
+    for e in zip_events:
+        assert 1 <= e["step"] <= e["total"]
 
 
 def test_progress_no_duplicate_spanning_steps():
