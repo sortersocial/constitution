@@ -212,6 +212,84 @@
 ;; SSE reader — collect N events from the stream
 ;; ---------------------------------------------------------------------------
 
+(def ^:private slug-live-base "https://slug.social")
+(def ^:private slug-model-parent "slug/token/commit-ranking/model")
+
+(defn- curl-json!
+  "GET url with curl -f; parse JSON or throw."
+  [url]
+  (let [r @(p/process ["curl" "-sS" "-f" url] {:out :string :err :string})]
+    (when-not (zero? (:exit r))
+      (fail (str "curl -f failed: " url " exit " (:exit r) " err: " (:err r)))
+      (throw (ex-info "curl failed" {:url url})))
+    (json/parse-string (:out r) true)))
+
+(defn- first-item-path-from-slug-rank
+  "Highest-score ranked item, else first unranked path."
+  [rank-data]
+  (let [ranked (sort-by (comp - :score)
+                        (mapcat :ranking (:components rank-data)))]
+    (or (:item (first ranked))
+        (first (:unranked_items rank-data)))))
+
+(defn- openrouter-id-from-body
+  [body]
+  (when (string? body)
+    (when-let [m (re-find #"https?://openrouter\.ai/(.+?)\s*$" (str/trim body))]
+      (str/trim (second m)))))
+
+(defn- test-live-slug-model-council! [root]
+  (if (= "1" (System/getenv "SKIP_LIVE_SLUG_SOCIAL"))
+    (println "\n━━━ live slug.social checks skipped (SKIP_LIVE_SLUG_SOCIAL=1) ━━━\n")
+    (letlocals
+      (println "\n━━━ live slug.social: /api/v0 + fetch_top_models ━━━\n")
+      (bind rank-url (str slug-live-base "/api/v0/rank?parent="
+                          (java.net.URLEncoder/encode slug-model-parent "UTF-8")))
+      (bind rank (curl-json! rank-url))
+      (assert! (not= false (:ok rank)) "slug /api/v0/rank not ok:false")
+      (bind item-path (first-item-path-from-slug-rank rank))
+      (assert! (some? item-path) "slug rank has a ranked or unranked model item")
+      (assert! (str/starts-with? item-path "/slug/token/commit-ranking/model/")
+               (str "item under model/ namespace (got " item-path ")"))
+      (bind item-param (str/replace-first item-path #"^/" ""))
+      (bind item-url (str slug-live-base "/api/v0/item?item="
+                          (java.net.URLEncoder/encode item-param "UTF-8")))
+      (bind item (curl-json! item-url))
+      (assert! (= item-path (:item item)) "slug /api/v0/item path matches rank")
+      (assert! (str/includes? (str (:body item)) "openrouter.ai")
+               "item body references openrouter.ai")
+      (bind expected-id (openrouter-id-from-body (:body item)))
+      (assert! (some? expected-id) (str "parse OpenRouter id from body: " (pr-str (:body item))))
+      (println "  slug item → OpenRouter id:" expected-id)
+      (bind py-env (merge (into {} (System/getenv))
+                          {"SESSION_SECRET" "live-slug-test"
+                           "GENESIS_MS" "1"
+                           "SLUG_SOCIAL_BASE_URL" slug-live-base
+                           "SLUG_MODEL_RANK_PARENT" slug-model-parent
+                           "OPENROUTER_API_KEY" ""}))
+      (bind py @(p/process ["uv" "run" "python" "-c"
+                            (str "import asyncio, json, os\n"
+                                 "os.environ.setdefault('SESSION_SECRET','x')\n"
+                                 "os.environ.setdefault('GENESIS_MS','1')\n"
+                                 "os.environ['SLUG_SOCIAL_BASE_URL'] = '"
+                                 slug-live-base "'\n"
+                                 "os.environ['SLUG_MODEL_RANK_PARENT'] = '"
+                                 slug-model-parent "'\n"
+                                 "os.environ['OPENROUTER_API_KEY'] = ''\n"
+                                 "import constitution\n"
+                                 "async def _m():\n"
+                                 "    m = await constitution.fetch_top_models(3)\n"
+                                 "    print(json.dumps(m))\n"
+                                 "asyncio.run(_m())\n")]
+                           {:out :string :err :string :dir root :env py-env}))
+      (assert! (zero? (:exit py))
+               (str "uv run python fetch_top_models exit " (:exit py) " err: " (:err py)))
+      (bind models (json/parse-string (str/trim (:out py))))
+      (assert! (sequential? models) "fetch_top_models prints JSON array")
+      (assert! (pos? (count models)) "fetch_top_models non-empty")
+      (assert! (some #(= expected-id %) models)
+               (str "fetch_top_models includes slug-derived id " expected-id " got " (pr-str models))))))
+
 (defn- read-sse-events
   "Collect up to n SSE `data:` payloads via curl -N (babashka blocks HttpURLConnection)."
   [url n timeout-ms]
@@ -258,6 +336,7 @@
     (bind genesis-ms   (str (- (System/currentTimeMillis) (* 35 24 60 60 1000))))
 
     (bind root          (project-root))
+    (test-live-slug-model-council! root)
     (bind server-env
       {"SESSION_SECRET"       "test-secret"
        "GENESIS_MS"           genesis-ms
