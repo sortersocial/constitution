@@ -1,0 +1,87 @@
+{{
+1. Eventlog schema 2. Rank centrality code (10lines compressed) 3. Sort commits since last epoch using council of llms (how to handle new llms being released). 4. Redemptions evaleval UI with GitHub oauth  5. the four prongs of the howey test script (this is in slug, search for it?)
+}}
+
+payments.py
+├── 1. CONSTANTS & SCHEMA
+│   ├── Laskar polynomial coefficients
+│   ├── Promethium-145 half-life (17.72577371892 years)
+│   ├── Exact decay rate (0.3253356063468% per epoch)
+│   ├── Genesis timestamp
+│   ├── Event log schema (JSONL)
+│   └── Token supply (177,600), LP (1,776)
+│
+├── 2. EPOCH BOUNDARY CHECK
+│   ├── Evaluate Laskar polynomial at current T
+│   ├── Has genesis_ms + Σ(epoch_durations) passed?
+│   ├── No → exit
+│   └── Yes → continue
+│
+├── 3. RANK CENTRALITY (10 lines)
+│   ├── Build transition matrix from pairwise comparisons
+│   ├── Power iteration to stationary distribution
+│   └── Return scores
+│
+├── 4. COMMIT RANKING
+│   ├── Pull commits since last epoch from git log
+│   ├── Council of LLMs does pairwise comparisons
+│   ├── Run rank centrality on the results
+│   └── Output: contributor scores for this epoch
+│
+├── 5. EMISSION
+│   ├── Compute: pool_remaining * 0.003253356063468
+│   ├── Distribute to contributors by score
+│   └── Append to JSONL
+│
+├── 6. FOUR FUNCTIONS (distribution)
+│   ├── Query $SLUG ownership on Solana
+│   ├── Query commit-ranking diff
+│   ├── Query treasury USDC balance
+│   └── Distribute USDC to holders, contributor pool
+│       share flows through to contributors by score
+│
+├── 7. REDEMPTION UI (evaleval)
+│   ├── GitHub OAuth login
+│   ├── Show contributor's rank & unclaimed emissions
+│   ├── Paste Solana wallet → redeem
+│   └── Signed snippets, one file, uv run
+│
+└── 8. JSONL APPEND
+    ├── Every emission recorded
+    ├── Every distribution recorded
+    ├── Every redemption recorded
+    └── The ledger IS the audit
+
+{{
+Maybe it queries openrouter for most recently released models, and does a random sample. Or takes from the top charts, if that's accessible by API. So we get good llms not just randomly released ones. But either would work. Also, I want it to happen at exactly the right millisecond, not just at cron epoch. So if it detects an epoch 24hrs into the future (default gh action timeout is 24hrs..) it waits until the exact millisecond to write the eventlog
+}}
+
+That's beautiful. The script wakes up every day, checks the Laskar polynomial, and if the epoch boundary is within 24 hours it just `time.sleep()` until the exact millisecond. The JSONL entry for every emission has a timestamp that matches the polynomial's predicted epoch boundary to the millisecond. The calendar *is* precise. Not approximately daily. Not "whenever the cron ran." The exact millisecond the planet says the epoch turned.
+
+```python
+boundary = epoch_boundary(genesis_ms, next_epoch)
+now = int(time.time() * 1000)
+wait = boundary - now
+
+if 0 < wait < 86_400_000:  # within 24 hours
+    time.sleep(wait / 1000)
+    # NOW emit. At the exact millisecond.
+```
+
+And for the model selection — OpenRouter has a `/api/v1/models` endpoint that returns all available models with metadata including pricing, context length, and when they were created. You could sort by release date and take the top N most recent above some quality threshold, or pull from their rankings if they expose that. Random sample from the top tier means no single model's biases dominate, and the JSONL records which models comprised the council for each epoch. Reproducible forever.
+
+So the Action flow is:
+
+1. Cron fires daily at midnight UTC
+2. Script evaluates Laskar polynomial for next epoch boundary
+3. If boundary > 24hrs away → exit
+4. If boundary < 24hrs away → sleep until the exact millisecond
+5. Query OpenRouter for top models
+6. Pull commits since last epoch
+7. Council of LLMs does pairwise comparisons
+8. Rank centrality produces contributor scores
+9. Emit `pool * 0.003253356063468` tokens to contributors by score
+10. Four functions: query holdings, query rankings, query treasury, distribute
+11. Append everything to JSONL at the epoch-boundary timestamp
+
+The emission timestamp in the ledger matches the tropical year polynomial to the millisecond. Every epoch boundary for the next 17.72577371892 years is deterministic from genesis. The planet decides when. The script obeys.
