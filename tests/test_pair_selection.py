@@ -146,32 +146,23 @@ def test_spanning_tree_covers_all_items():
 # ---------------------------------------------------------------------------
 
 def test_zip_terminates_when_already_sorted():
-    """If every comparison confirms the current order, one zip pass suffices.
-
-    Note: rank_centrality gives LOWER pi to winners (the stationary distribution
-    flows toward losers). So with lower_wins (item 0 always wins), item 0 has
-    the LOWEST pi and item 3 (always loses) has the HIGHEST pi. Sorted by pi
-    descending: [3, 2, 1, 0].
-    """
+    """If every comparison confirms the current order, one zip pass suffices."""
     n = 4
     cmp = make_compare_fn(lower_wins)
     pairs = run(pairwise_rank(n, cmp))
     scores = rank_centrality(pairs)
     ranking = sorted(range(n), key=lambda i: scores[i], reverse=True)
-    assert ranking == [3, 2, 1, 0]  # item 3 has highest pi (biggest loser)
+    assert ranking == list(range(n))  # item 0 wins everything → highest score
 
 
 def test_zip_corrects_reversed_order():
-    """
-    With higher_wins (item 3 always wins), item 0 always loses — so pi[0] is
-    highest. Sorted by pi descending: [0, 1, 2, 3].
-    """
+    """higher_wins produces the inverse order; zip sort should converge to it."""
     n = 4
     cmp = make_compare_fn(higher_wins)
     pairs = run(pairwise_rank(n, cmp))
     scores = rank_centrality(pairs)
     ranking = sorted(range(n), key=lambda i: scores[i], reverse=True)
-    assert ranking == [0, 1, 2, 3]  # item 0 has highest pi (biggest loser)
+    assert ranking == [3, 2, 1, 0]  # item 3 wins everything → highest score
 
 
 def test_zip_single_pass_minimum():
@@ -274,36 +265,77 @@ def test_progress_no_duplicate_spanning_steps():
 # ---------------------------------------------------------------------------
 
 def test_rank_centrality_accumulates_multiple_votes():
-    """Multiple pairs for the same (i, j) should accumulate, not overwrite.
-
-    Two identical votes double the weights but preserve the ratio, so the
-    resulting pi values should be the same as a single vote.
-    rank_centrality gives LOWER pi to winners, so scores[0] < scores[1].
-    """
+    """Two identical votes double the weights but preserve the ratio → same pi."""
     pairs_double = [(0, 1, 2.0, 1.0), (0, 1, 2.0, 1.0)]
     pairs_single = [(0, 1, 2.0, 1.0)]
     scores_d = rank_centrality(pairs_double)
     scores_s = rank_centrality(pairs_single)
-    # Item 0 wins → lower pi. Item 1 loses → higher pi. True for both.
-    assert scores_d[1] > scores_d[0]
-    assert scores_s[1] > scores_s[0]
+    # Item 0 wins → higher score.
+    assert scores_d[0] > scores_d[1]
+    assert scores_s[0] > scores_s[1]
     # Doubling identical votes preserves the ratio → same pi.
     assert abs(scores_d[0] - scores_s[0]) < 1e-9
 
 
 def test_rank_centrality_conflicting_votes_not_erased():
-    """With +=, conflicting votes from two models both contribute.
-
-    Without accumulation (= instead of +=), the second model's vote would
-    overwrite the first, erasing it entirely. With += both stack.
+    """With +=, both models' votes accumulate.
 
     Model A: 0 beats 1 strongly (3:1). Model B: 1 beats 0 weakly (1.5:1).
-    Net: 0 is still the stronger winner. rank_centrality gives lower pi to
-    winners, so scores[0] < scores[1].
+    Net: 0 is still the stronger winner → scores[0] > scores[1].
 
-    With the overwrite bug, model B would erase model A, flipping the result.
+    With the old overwrite bug, model B's vote would erase model A entirely.
     """
     pairs = [(0, 1, 3.0, 1.0), (1, 0, 1.5, 1.0)]
     scores = rank_centrality(pairs)
-    # Item 0 is net winner → lower pi.
-    assert scores[1] > scores[0]
+    assert scores[0] > scores[1]
+
+
+# ---------------------------------------------------------------------------
+# rank_centrality correctness — winners should win
+# ---------------------------------------------------------------------------
+
+def test_rank_centrality_two_items_winner_ranks_higher():
+    scores = rank_centrality([(0, 1, 2.0, 1.0)])
+    assert scores[0] > scores[1]
+
+
+def test_rank_centrality_scores_sum_to_one():
+    import numpy as np
+    scores = rank_centrality([(0, 1, 2.0, 1.0), (1, 2, 3.0, 1.0), (0, 2, 4.0, 1.0)])
+    assert abs(scores.sum() - 1.0) < 1e-9
+
+
+def test_rank_centrality_total_order_three_items():
+    """0 beats 1 beats 2, and 0 beats 2 directly — strict ranking expected."""
+    pairs = [(0, 1, 2.0, 1.0), (1, 2, 2.0, 1.0), (0, 2, 4.0, 1.0)]
+    scores = rank_centrality(pairs)
+    assert scores[0] > scores[1] > scores[2]
+
+
+def test_rank_centrality_unanimous_council_strengthens_winner():
+    """Three models all agree: 0 beats 1. Each vote stacks; 0 still wins."""
+    pairs = [(0, 1, 2.0, 1.0)] * 3
+    scores = rank_centrality(pairs)
+    assert scores[0] > scores[1]
+
+
+def test_rank_centrality_dominant_item_ranks_first():
+    """Item 0 beats everyone. It should have the highest score."""
+    n = 5
+    pairs = [(0, i, 3.0, 1.0) for i in range(1, n)]
+    scores = rank_centrality(pairs)
+    assert scores[0] == max(scores)
+
+
+def test_rank_centrality_symmetric_vote_equal_scores():
+    """If 0 beats 1 and 1 beats 0 equally, scores should be equal."""
+    pairs = [(0, 1, 1.0, 1.0), (1, 0, 1.0, 1.0)]
+    scores = rank_centrality(pairs)
+    assert abs(scores[0] - scores[1]) < 1e-9
+
+
+def test_rank_centrality_stronger_ratio_gives_higher_score():
+    """0 beats 1 with 9:1 vs 0 beats 1 with 2:1 — 9:1 winner scores higher."""
+    scores_strong = rank_centrality([(0, 1, 9.0, 1.0)])
+    scores_weak   = rank_centrality([(0, 1, 2.0, 1.0)])
+    assert scores_strong[0] > scores_weak[0]

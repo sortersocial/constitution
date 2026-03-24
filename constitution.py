@@ -164,8 +164,8 @@ def rank_centrality(pairs):
     n = max(items) + 1
     W = np.zeros((n, n))
     for w, l, wr, lr in pairs:
-        W[w][l] += wr   # accumulate: multiple model votes for same pair stack
-        W[l][w] += lr
+        W[l][w] += wr   # A[loser][winner] = preference for winner over loser
+        W[w][l] += lr   # A[winner][loser] = preference for loser over winner
     P = np.zeros((n, n))
     for i in range(n):
         for j in range(n):
