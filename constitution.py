@@ -30,7 +30,10 @@ from fastapi.responses import PlainTextResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
 import json, time, os, asyncio, httpx, pathlib
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-from evaleval import event, JsonlStore, to_dict, render, RawContent, Signer, SnippetExecutionError
+from evaleval import (
+    event, JsonlStore, to_dict, render, RawContent, Signer, SnippetExecutionError,
+    exec_event, One, Two, Three, Selector, MORPH, PREPEND,
+)
 
 getcontext().prec = 50
 
@@ -491,9 +494,10 @@ async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
 SSE_CLIENTS = []
 
 
-async def broadcast_sse(event_type, data):
+async def broadcast_js(js: str):
+    """Send a JS snippet to all connected SSE clients."""
     for queue in SSE_CLIENTS:
-        await queue.put(f"event: {event_type}\ndata: {json.dumps(data)}\n\n")
+        await queue.put(js)
 
 
 async def rank_commits(since_ms):
@@ -505,7 +509,9 @@ async def rank_commits(since_ms):
         commit_diffs = await asyncio.gather(*[fetch_commit_unified_diff(gh, c["sha"]) for c in commits])
 
     models = await fetch_top_models(n=3)
-    await broadcast_sse("council", {"models": models, "commits": len(commits)})
+    await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+        ["div.log-council", f"Council: {', '.join(models)} — {len(commits)} commits"]
+    ]))
 
     authors = list(set(c["commit"]["author"]["name"] for c in commits))
     author_idx = {a: i for i, a in enumerate(authors)}
@@ -527,22 +533,38 @@ async def rank_commits(since_ms):
 
     async def compare_fn(i, j):
         a1, a2 = authors[i], authors[j]
+        await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
+            ["div#emission-status", f"Comparing {a1} vs {a2}…"]
+        ]))
         results = []
         for model in models:
-            await broadcast_sse("comparing", {"model": model, "a": a1, "b": a2})
             try:
                 result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
                 w, l = (i, j) if result["winner"] == "A" else (j, i)
                 ratio = result["ratio"].split(":")
                 results.append((w, l, float(ratio[0]), float(ratio[1])))
-                await broadcast_sse("vote", {"model": model, "winner": authors[w], "loser": authors[l],
-                                             "ratio": result["ratio"], "explanation": result["explanation"]})
+                await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+                    ["div.log-vote",
+                        ["span.model", model], " — ",
+                        ["span.winner", authors[w]], f" beat ",
+                        ["span.loser", authors[l]], f" ({result['ratio']}) ",
+                        ["span.explanation", result["explanation"]],
+                    ]
+                ]))
             except Exception as e:
-                await broadcast_sse("error", {"model": model, "error": str(e)})
+                await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+                    ["div.log-error", f"⚠ {model}: {e}"]
+                ]))
         return results
 
-    async def progress_fn(event):
-        await broadcast_sse("progress", event)
+    async def progress_fn(ev):
+        if ev["phase"] == "spanning_tree":
+            label = f"Spanning tree: {ev['step']}/{ev['total']}"
+        else:
+            label = f"Zip pass {ev['pass']}: {ev['step']}/{ev['total']}"
+        await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
+            ["div#emission-status", label]
+        ]))
 
     pairs = await pairwise_rank(len(authors), compare_fn, progress_fn)
 
@@ -551,7 +573,13 @@ async def rank_commits(since_ms):
 
     scores = rank_centrality(pairs)
     ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
-    await broadcast_sse("ranking", {a: float(s) for a, s in ranking.items()})
+    ranking_rows = sorted(ranking.items(), key=lambda x: x[1], reverse=True)
+    await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+        ["div.log-ranking",
+            ["b", "Ranking: "],
+            *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in ranking_rows],
+        ]
+    ]))
     return ranking
 
 
@@ -565,14 +593,16 @@ def pool_remaining(events: list) -> Decimal:
 
 
 async def run_emission(epoch_n, boundary_ms):
-    await broadcast_sse("emission_start", {"epoch": epoch_n, "boundary_ms": boundary_ms})
+    await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+        ["div.log-start", f"⚡ Epoch {epoch_n} emission started"]
+    ]))
 
     pool = pool_remaining(store.read())
     emission = pool * DECAY_RATE
-    await broadcast_sse("emission_amount", {
-        "pool_before": str(pool), "emission": str(emission),
-        "pool_after": str(pool - emission), "decay_rate": str(DECAY_RATE),
-    })
+    await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+        ["div.log-amount",
+            f"Pool {pool:.4f} → emit {emission:.4f} → {pool - emission:.4f}"]
+    ]))
 
     prev_boundary_ms = epoch_boundary(epoch_n - 1) if epoch_n > 0 else GENESIS_MS
     ranking = await rank_commits(prev_boundary_ms)
@@ -596,7 +626,10 @@ async def run_emission(epoch_n, boundary_ms):
 
     entry = await store.atomic(make_emission)
     if entry:
-        await broadcast_sse("emission_complete", to_dict(entry))
+        await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+            ["div.log-complete",
+                ["b", f"✓ Epoch {entry.epoch} complete — emitted {entry.total_emitted} SLUG"]]
+        ]))
     return entry
 
 
@@ -641,11 +674,10 @@ async def epoch_loop():
                 await run_emission(epoch_n, current_start)
             await asyncio.sleep(60)
         elif wait_ms < 86_400_000:
-            await broadcast_sse("waiting", {
-                "next_epoch": epoch_n + 1,
-                "boundary_ms": next_boundary,
-                "wait_seconds": wait_ms / 1000,
-            })
+            await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
+                ["div#emission-status",
+                    f"Next epoch {epoch_n + 1} in {wait_ms / 1000:.0f}s"]
+            ]))
             await asyncio.sleep(wait_ms / 1000)
             await run_emission(epoch_n + 1, next_boundary)
         else:
@@ -739,7 +771,9 @@ async def sse_stream(request: Request):
 
     async def generate():
         try:
-            yield f"event: connected\ndata: {json.dumps({'epoch': current_epoch()[0]})}\n\n"
+            yield exec_event(Three[Selector("#emission-status")][MORPH][
+                ["div#emission-status", f"Connected — epoch {current_epoch()[0]}"]
+            ])
             while True:
                 if await request.is_disconnected():
                     break
