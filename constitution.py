@@ -47,10 +47,10 @@ HALF_LIFE_YEARS = Decimal("17.72577371892")
 
 # Derived constants
 TOTAL_SUPPLY = Decimal("177600")
-LP_TOKENS = Decimal("1776")           # 1% of supply
-CONTRIBUTOR_POOL = Decimal("175824")   # 99% of supply
-EPOCHS_PER_HALFLIFE = float(HALF_LIFE_YEARS) * 12  # 212.70928462704
-DECAY_RATE = Decimal(str(1 - 0.5 ** (1 / EPOCHS_PER_HALFLIFE)))  # 0.3253356063468%
+LP_TOKENS = Decimal("1776")
+CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
+EPOCHS_PER_HALFLIFE = HALF_LIFE_YEARS * 12
+DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
 
 GENESIS_MS = int(os.environ["GENESIS_MS"])  # set once, never changed
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
