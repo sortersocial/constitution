@@ -1,0 +1,18 @@
+[project]
+name = "slug-constitution"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "evaleval>=0.2.6",
+    "numpy",
+    "httpx",
+    "fastapi",
+    "uvicorn",
+    "tenacity",
+    "starlette",
+    "itsdangerous",
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

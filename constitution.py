@@ -156,8 +156,8 @@ def rank_centrality(pairs):
     n = max(items) + 1
     W = np.zeros((n, n))
     for w, l, wr, lr in pairs:
-        W[w][l] = wr
-        W[l][w] = lr
+        W[w][l] += wr   # accumulate: multiple model votes for same pair stack
+        W[l][w] += lr
     P = np.zeros((n, n))
     for i in range(n):
         for j in range(n):
@@ -174,6 +174,108 @@ def rank_centrality(pairs):
             break
         pi = pi_next
     return pi / pi.sum()
+
+
+# ===========================================================================
+# §3b. PAIR SELECTION — spanning tree + zip sort
+#
+# Two-phase algorithm so we make the minimum useful comparisons:
+#
+# Phase 1 — spanning tree: union-find, compare only pairs that bridge
+#   disconnected components. Exactly N-1 comparisons for N authors.
+#
+# Phase 2 — zip sort: bubble-sort passes over the current ranking.
+#   Compare adjacent pairs (#1 vs #2, #2 vs #3, …), re-rank after each.
+#   Repeat passes until a full pass produces no ranking changes.
+#   Non-deterministic: each comparison can shift the ranking, changing
+#   which authors are adjacent on the next step.
+#
+# Progress is reported in terms of phase/pass/step, not total pairs,
+# because the total is unknown until the zip sort converges.
+# ===========================================================================
+
+class UnionFind:
+    def __init__(self, n: int):
+        self._parent = list(range(n))
+        self._rank = [0] * n
+
+    def find(self, x: int) -> int:
+        if self._parent[x] != x:
+            self._parent[x] = self.find(self._parent[x])  # path compression
+        return self._parent[x]
+
+    def union(self, x: int, y: int) -> None:
+        px, py = self.find(x), self.find(y)
+        if px == py:
+            return
+        if self._rank[px] < self._rank[py]:
+            px, py = py, px
+        self._parent[py] = px
+        if self._rank[px] == self._rank[py]:
+            self._rank[px] += 1
+
+    def connected(self, x: int, y: int) -> bool:
+        return self.find(x) == self.find(y)
+
+    def num_components(self) -> int:
+        return sum(1 for i in range(len(self._parent)) if self.find(i) == i)
+
+
+async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
+    """
+    Two-phase pairwise ranking. Returns list of (w, l, wr, lr) pairs
+    suitable for rank_centrality().
+
+    compare_fn: async (i, j) -> list[(winner_idx, loser_idx, w_ratio, l_ratio)]
+      Returns a list so multiple model votes per comparison are supported.
+
+    progress_fn: async (event: dict) -> None  (optional)
+      event has keys: phase, step, total, and for zip: pass.
+    """
+    if n <= 1:
+        return []
+
+    pairs = []
+
+    async def compare(i, j):
+        results = await compare_fn(i, j)
+        pairs.extend(results)
+        return results
+
+    # --- Phase 1: spanning tree ---
+    uf = UnionFind(n)
+    for i in range(n - 1):
+        if not uf.connected(i, i + 1):
+            await compare(i, i + 1)
+            uf.union(i, i + 1)
+        if progress_fn:
+            await progress_fn({"phase": "spanning_tree", "step": i + 1, "total": n - 1})
+
+    # --- Phase 2: zip sort ---
+    for pass_num in range(n):  # at most n passes (bubble sort bound)
+        scores = rank_centrality(pairs)
+        ranking = sorted(range(n), key=lambda idx: scores[idx], reverse=True)
+
+        had_swap = False
+        for step in range(n - 1):
+            a, b = ranking[step], ranking[step + 1]
+            await compare(a, b)
+
+            new_scores = rank_centrality(pairs)
+            new_ranking = sorted(range(n), key=lambda idx: new_scores[idx], reverse=True)
+
+            if progress_fn:
+                await progress_fn({"phase": "zip", "pass": pass_num + 1,
+                                   "step": step + 1, "total": n - 1})
+
+            if new_ranking != ranking:
+                had_swap = True
+                ranking = new_ranking
+
+        if not had_swap:
+            break
+
+    return pairs
 
 
 # ===========================================================================
@@ -323,22 +425,26 @@ async def rank_commits(since_ms):
             "diff": "\n\n".join(f"=== {c['sha']} ===\n{c['diff']}" for c in cs),
         }
 
-    pairs = []
-    for i, a1 in enumerate(authors):
-        for j, a2 in enumerate(authors):
-            if i >= j:
-                continue
-            for model in models:
-                await broadcast_sse("comparing", {"model": model, "a": a1, "b": a2})
-                try:
-                    result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
-                    w, l = (a1, a2) if result["winner"] == "A" else (a2, a1)
-                    ratio = result["ratio"].split(":")
-                    pairs.append((author_idx[w], author_idx[l], float(ratio[0]), float(ratio[1])))
-                    await broadcast_sse("vote", {"model": model, "winner": w, "loser": l,
-                                                 "ratio": result["ratio"], "explanation": result["explanation"]})
-                except Exception as e:
-                    await broadcast_sse("error", {"model": model, "error": str(e)})
+    async def compare_fn(i, j):
+        a1, a2 = authors[i], authors[j]
+        results = []
+        for model in models:
+            await broadcast_sse("comparing", {"model": model, "a": a1, "b": a2})
+            try:
+                result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
+                w, l = (i, j) if result["winner"] == "A" else (j, i)
+                ratio = result["ratio"].split(":")
+                results.append((w, l, float(ratio[0]), float(ratio[1])))
+                await broadcast_sse("vote", {"model": model, "winner": authors[w], "loser": authors[l],
+                                             "ratio": result["ratio"], "explanation": result["explanation"]})
+            except Exception as e:
+                await broadcast_sse("error", {"model": model, "error": str(e)})
+        return results
+
+    async def progress_fn(event):
+        await broadcast_sse("progress", event)
+
+    pairs = await pairwise_rank(len(authors), compare_fn, progress_fn)
 
     if not pairs:
         return {authors[0]: Decimal("1")} if authors else {}
