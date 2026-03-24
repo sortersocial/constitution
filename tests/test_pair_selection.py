@@ -2,7 +2,10 @@
 Unit tests for the two-phase pairwise ranking algorithm.
 
 Phase 1 — spanning tree: union-find, bridge all disconnected components.
-Phase 2 — zip sort: bubble-sort passes over current ranking until stable.
+Phase 2 — zip sort: before every step, re-derive the current ranking and
+  compare the first adjacent pair that has no direct comparison result yet.
+  Terminates when every adjacent slot is covered.  No pair is ever compared
+  more than once.
 
 compare_fn(i, j) -> list of (winner_idx, loser_idx, w_ratio, l_ratio)
   Returns a list so multiple model votes per comparison are supported.
@@ -165,17 +168,26 @@ def test_zip_corrects_reversed_order():
     assert ranking == [3, 2, 1, 0]  # item 3 wins everything → highest score
 
 
-def test_zip_single_pass_minimum():
-    """At least one full zip pass (n-1 comparisons) after spanning tree."""
-    n = 4
-    cmp = make_compare_fn(lower_wins)
-    run(pairwise_rank(n, cmp))
-    # Phase 1: n-1 = 3 comparisons. Phase 2 at least one pass: n-1 = 3 more.
-    assert len(cmp.calls) >= 2 * (n - 1)
+def test_spanning_tree_terminates_without_zip_when_fully_covers_adjacent_pairs():
+    """
+    When the spanning-tree comparisons already cover every adjacent pair in
+    the rank_centrality ordering, phase 2 makes zero additional comparisons.
+
+    With higher_wins the spanning tree compares (0,1),(1,2),(2,3) and the
+    resulting ranking is [3,2,1,0] whose adjacent pairs {2,3},{1,2},{0,1}
+    are exactly the spanning-tree pairs — all covered, so zip exits at once.
+    """
+    for n in range(2, 7):
+        cmp = make_compare_fn(higher_wins)
+        run(pairwise_rank(n, cmp))
+        assert len(cmp.calls) == n - 1, (
+            f"n={n}: expected only spanning-tree comparisons ({n-1}), "
+            f"got {len(cmp.calls)}"
+        )
 
 
 def test_zip_bounded_by_n_passes():
-    """Total comparisons bounded: n-1 (spanning) + n*(n-1) (max zip passes)."""
+    """Total comparisons bounded: n-1 (spanning) + n*(n-1) (max zip pairs)."""
     n = 5
     cmp = make_compare_fn(lower_wins)
     run(pairwise_rank(n, cmp))
@@ -183,10 +195,48 @@ def test_zip_bounded_by_n_passes():
     assert len(cmp.calls) <= max_comparisons
 
 
-def test_zip_stable_compare_fn_one_pass():
+def test_zip_rescan_from_top_after_ranking_shift():
     """
-    A compare_fn consistent with the initial ranking should trigger exactly
-    one zip pass (the pass finds no swaps and exits).
+    Exemplifies the bug in the old algorithm.
+
+    Old behaviour: the zip loop iterated step=0,1,…,n-2 within a pass,
+    updating `ranking` after each comparison but never going back.  When a
+    comparison at step k shifted the global rank_centrality scores so that
+    position k-1 now held a brand-new, never-compared pair, the old code
+    skipped it until the next full pass — re-comparing already-settled pairs
+    (including spanning-tree pairs) along the way.
+
+    New behaviour: before every comparison the full ranking is re-derived and
+    the *first* uncovered adjacent slot is chosen.  Each pair is compared at
+    most once; the algorithm terminates as soon as every adjacent slot is
+    covered.
+
+    Verification: across all deterministic total orders and small n, no pair
+    is ever compared more than once.  The old algorithm violated this for
+    lower_wins (where the spanning-tree chain already establishes the correct
+    order, yet the old zip pass re-compared every spanning-tree pair).
+    """
+    for n in range(2, 7):
+        for winner_fn in [lower_wins, higher_wins]:
+            cmp = make_compare_fn(winner_fn)
+            run(pairwise_rank(n, cmp))
+
+            seen: set = set()
+            for i, j in cmp.calls:
+                pair = frozenset({i, j})
+                assert pair not in seen, (
+                    f"Bug: {winner_fn.__name__} n={n}: "
+                    f"pair ({i},{j}) compared more than once.\n"
+                    f"All calls: {cmp.calls}"
+                )
+                seen.add(pair)
+
+
+def test_zip_stable_compare_fn_spanning_tree_only():
+    """
+    When lower index always wins, the spanning-tree chain (0,1),(1,2),…
+    establishes ranking [0,1,2,…] whose adjacent pairs are already covered.
+    Phase 2 makes zero additional comparisons.
     """
     n = 3
     comparisons = []
@@ -196,8 +246,8 @@ def test_zip_stable_compare_fn_one_pass():
         return [(min(i, j), max(i, j), 2.0, 1.0)]
 
     run(pairwise_rank(n, stable_compare))
-    # Spanning tree: n-1 = 2. One zip pass: n-1 = 2. Total = 4.
-    assert len(comparisons) == 2 * (n - 1)
+    # Only the spanning tree's n-1 comparisons; zip exits immediately.
+    assert len(comparisons) == n - 1
 
 
 # ---------------------------------------------------------------------------
@@ -219,34 +269,53 @@ def test_progress_reports_spanning_tree_phase():
 
 
 def test_progress_reports_zip_phase():
+    """Zip events carry pass/step/total keys; pass is always 1; step increases."""
     events = []
 
     async def progress_fn(event):
         events.append(event)
 
-    run(pairwise_rank(3, make_compare_fn(lower_wins), progress_fn))
+    # With lower_wins the spanning tree alone covers all adjacencies, so use a
+    # compare_fn that leaves one adjacent pair uncovered: (0,1)→0 wins 1.1:1,
+    # (1,2)→2 wins 100:1.  rank_centrality then gives ranking [2,0,1] whose
+    # pair {0,2} is not in the spanning tree → exactly one zip comparison.
+    async def one_zip_cmp(i, j):
+        if frozenset({i, j}) == frozenset({0, 1}):
+            return [(0, 1, 1.1, 1.0)]
+        if frozenset({i, j}) == frozenset({1, 2}):
+            return [(2, 1, 100.0, 1.0)]
+        return [(min(i, j), max(i, j), 2.0, 1.0)]
+
+    run(pairwise_rank(3, one_zip_cmp, progress_fn))
     zip_events = [e for e in events if e["phase"] == "zip"]
     assert len(zip_events) > 0
     for e in zip_events:
         assert "pass" in e
         assert "step" in e
         assert "total" in e
-        assert e["pass"] >= 1
-        assert 1 <= e["step"] <= e["total"]
+        assert e["pass"] == 1          # exactly one logical pass
+        assert e["step"] >= 1
+        assert e["total"] == 2         # n-1 = 2
 
 
-def test_progress_pass_numbers_increase():
+def test_progress_zip_step_increases():
+    """Zip step counter increases with each comparison."""
     events = []
 
     async def progress_fn(event):
         events.append(event)
 
-    # higher_wins causes swaps, triggering multiple passes.
-    run(pairwise_rank(4, make_compare_fn(higher_wins), progress_fn))
+    async def one_zip_cmp(i, j):
+        if frozenset({i, j}) == frozenset({0, 1}):
+            return [(0, 1, 1.1, 1.0)]
+        if frozenset({i, j}) == frozenset({1, 2}):
+            return [(2, 1, 100.0, 1.0)]
+        return [(min(i, j), max(i, j), 2.0, 1.0)]
+
+    run(pairwise_rank(3, one_zip_cmp, progress_fn))
     zip_events = [e for e in events if e["phase"] == "zip"]
-    passes_seen = sorted(set(e["pass"] for e in zip_events))
-    assert passes_seen[0] == 1
-    assert passes_seen == list(range(1, len(passes_seen) + 1))
+    steps = [e["step"] for e in zip_events]
+    assert steps == list(range(1, len(steps) + 1))
 
 
 def test_progress_no_duplicate_spanning_steps():

@@ -195,11 +195,14 @@ def rank_centrality(pairs):
 # Phase 1 — spanning tree: union-find, compare only pairs that bridge
 #   disconnected components. Exactly N-1 comparisons for N authors.
 #
-# Phase 2 — zip sort: bubble-sort passes over the current ranking.
-#   Compare adjacent pairs (#1 vs #2, #2 vs #3, …), re-rank after each.
-#   Repeat passes until a full pass produces no ranking changes.
-#   Non-deterministic: each comparison can shift the ranking, changing
-#   which authors are adjacent on the next step.
+# Phase 2 — zip sort: repeatedly find the first adjacent pair in the
+#   current ranking that has no direct comparison result yet and compare
+#   it.  The ranking is re-derived from scratch before every step, so a
+#   comparison at position k cannot silently skip a newly-adjacent
+#   uncovered pair at position k-1.
+#   Terminates when every adjacent slot in the current ranking already
+#   has at least one LLM-reasoned comparison result.  No pair is ever
+#   compared more than once.
 #
 # Progress is reported in terms of phase/pass/step, not total pairs,
 # because the total is unknown until the zip sort converges.
@@ -241,16 +244,20 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
       Returns a list so multiple model votes per comparison are supported.
 
     progress_fn: async (event: dict) -> None  (optional)
-      event has keys: phase, step, total, and for zip: pass.
+      event has keys: phase, step, total, and for zip: pass (always 1).
+
+    # @b1050ff3-000c-4a8f-8b46-c5ef91d696c7:cursor:anthropic/claude-sonnet-4-5
     """
     if n <= 1:
         return []
 
     pairs = []
+    compared: set = set()  # frozensets of already-compared index pairs
 
     async def compare(i, j):
         results = await compare_fn(i, j)
         pairs.extend(results)
+        compared.add(frozenset((i, j)))
         return results
 
     # --- Phase 1: spanning tree ---
@@ -263,28 +270,41 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
             await progress_fn({"phase": "spanning_tree", "step": i + 1, "total": n - 1})
 
     # --- Phase 2: zip sort ---
-    for pass_num in range(n):  # at most n passes (bubble sort bound)
+    # Re-derive the ranking from scratch before every step.  A comparison at
+    # position k can shift rank_centrality scores so that a brand-new,
+    # never-compared pair appears at position k-1; the old pass-based loop
+    # would skip back to catch it only on the next full pass, re-comparing
+    # already-settled pairs along the way.
+    #
+    # Termination: every adjacent slot in the current ranking is occupied by
+    # a pair that already has at least one direct comparison result.
+    # There is exactly one logical pass; step counts position in current ranking.
+    step = 0
+    while True:
         scores = rank_centrality(pairs)
         ranking = sorted(range(n), key=lambda idx: scores[idx], reverse=True)
 
-        had_swap = False
-        for step in range(n - 1):
-            a, b = ranking[step], ranking[step + 1]
-            await compare(a, b)
+        target = None
+        for pos in range(n - 1):
+            a, b = ranking[pos], ranking[pos + 1]
+            if frozenset((a, b)) not in compared:
+                target = (pos, a, b)
+                break
 
-            new_scores = rank_centrality(pairs)
-            new_ranking = sorted(range(n), key=lambda idx: new_scores[idx], reverse=True)
+        if target is None:
+            break  # every adjacent edge has at least one LLM-reasoned result
 
-            if progress_fn:
-                await progress_fn({"phase": "zip", "pass": pass_num + 1,
-                                   "step": step + 1, "total": n - 1})
+        pos, a, b = target
+        step += 1
+        await compare(a, b)
 
-            if new_ranking != ranking:
-                had_swap = True
-                ranking = new_ranking
-
-        if not had_swap:
-            break
+        if progress_fn:
+            await progress_fn({
+                "phase": "zip",
+                "pass": 1,
+                "step": step,
+                "total": n - 1,
+            })
 
     return pairs
 
