@@ -155,6 +155,18 @@ def rank_centrality(pairs):
 
 # ===========================================================================
 # §4. COMMIT RANKING — council of LLMs, pairwise comparisons
+#
+# A note on security and prompt injection:
+# Because the LLM council reads raw commit messages and full unified diffs
+# (code, comments, strings in the patch), the system is technically vulnerable
+# to prompt injection (e.g., instructions in commit messages or in diff text).
+# 
+# The defense mechanism against this is the Benevolent Dictator For Life (BDFL)
+# of the repository. Commits with injected prompts simply will not be merged.
+# While relying on human curation might seem to contradict "decentralization,"
+# this bottleneck is an unavoidable reality of all FOSS projects: a human
+# maintainer must ultimately decide what code is worthy of the master branch.
+# The LLMs don't decide what gets merged; they only price what the BDFL accepts.
 # ===========================================================================
 
 async def fetch_top_models(n=3):
@@ -172,19 +184,23 @@ async def fetch_top_models(n=3):
         return [m["id"] for m in chat_models[:n]]
 
 
-async def llm_pairwise_compare(model_id, commit_a, commit_b):
-    """Ask one LLM: which commit contributed more? Return (winner, ratio)"""
+async def llm_pairwise_compare(model_id, side_a, side_b):
+    """Ask one LLM: which author's work (messages + full diffs) weighed more?"""
     prompt = f"""You are ranking contributions to an open source project.
-Compare these two commits and decide which contributed more.
+Compare these two sides (each may be one or more commits). Decide which side contributed more.
 Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
 
-Commit A:
-{commit_a['message']}
-{commit_a['diff_summary']}
+Side A — commit messages:
+{side_a['message']}
 
-Commit B:
-{commit_b['message']}
-{commit_b['diff_summary']}"""
+Side A — unified diffs (full patches):
+{side_a['diff']}
+
+Side B — commit messages:
+{side_b['message']}
+
+Side B — unified diffs (full patches):
+{side_b['diff']}"""
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -198,16 +214,49 @@ Commit B:
         return result
 
 
+def _github_headers():
+    h = {"Accept": "application/vnd.github+json"}
+    tok = os.environ.get("GITHUB_TOKEN", "")
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def unified_diff_from_commit_payload(payload: dict) -> str:
+    """Full textual diff from a GitHub GET /commits/{sha} JSON body (files[].patch)."""
+    parts = []
+    for f in payload.get("files") or []:
+        name = f.get("filename", "?")
+        patch = f.get("patch")
+        if patch:
+            parts.append(f"--- {name}\n{patch}")
+        else:
+            parts.append(
+                f"--- {name}\n[no textual patch from GitHub: binary, submodule, or too large]\n"
+            )
+    return "\n\n".join(parts) if parts else "[no files in API response]"
+
+
 async def fetch_commits_since(since_ms):
-    """Pull commits from the repo since last epoch"""
+    """Pull commits from the repo since last epoch (SHAs only; no per-file patches)."""
     since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"https://api.github.com/repos/{REPO}/commits",
             params={"since": since_iso, "per_page": 100},
-            headers={"Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN', '')}"},
+            headers=_github_headers(),
         )
         return resp.json()
+
+
+async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
+    """One commit's full unified diff via the single-commit API."""
+    resp = await client.get(
+        f"https://api.github.com/repos/{REPO}/commits/{sha}",
+        headers=_github_headers(),
+    )
+    resp.raise_for_status()
+    return unified_diff_from_commit_payload(resp.json())
 
 
 SSE_CLIENTS = []  # list of asyncio.Queue for live streaming
@@ -232,6 +281,10 @@ async def rank_commits(since_ms):
     if not commits:
         return {}
 
+    async with httpx.AsyncClient() as gh:
+        diff_tasks = [fetch_commit_unified_diff(gh, c["sha"]) for c in commits]
+        commit_diffs = await asyncio.gather(*diff_tasks)
+
     models = await fetch_top_models(n=3)
     await broadcast_sse("council", {"models": models, "commits": len(commits)})
 
@@ -239,14 +292,25 @@ async def rank_commits(since_ms):
     authors = list(set(c["commit"]["author"]["name"] for c in commits))
     author_idx = {a: i for i, a in enumerate(authors)}
 
-    # Group commits by author, summarize
+    # Group commits by author with full unified diff per commit (GitHub files[].patch)
     author_commits = {a: [] for a in authors}
-    for c in commits:
+    for c, diff_text in zip(commits, commit_diffs, strict=True):
         author_commits[c["commit"]["author"]["name"]].append({
             "message": c["commit"]["message"],
             "sha": c["sha"][:8],
-            "diff_summary": f"{c.get('stats', {}).get('additions', '?')}+ {c.get('stats', {}).get('deletions', '?')}-",
+            "diff": diff_text,
         })
+
+    def author_side_for_llm(author: str) -> dict:
+        lines_msg = []
+        blocks_diff = []
+        for c in author_commits[author]:
+            lines_msg.append(f"[{c['sha']}] {c['message']}")
+            blocks_diff.append(f"=== {c['sha']} ===\n{c['diff']}")
+        return {
+            "message": "\n".join(lines_msg),
+            "diff": "\n\n".join(blocks_diff),
+        }
 
     # Pairwise comparisons: each pair of authors, each model votes
     pairs = []
@@ -261,10 +325,8 @@ async def rank_commits(since_ms):
                 try:
                     result = await llm_pairwise_compare(
                         model,
-                        {"message": "; ".join(c["message"] for c in author_commits[a1]),
-                         "diff_summary": f"{len(author_commits[a1])} commits"},
-                        {"message": "; ".join(c["message"] for c in author_commits[a2]),
-                         "diff_summary": f"{len(author_commits[a2])} commits"},
+                        author_side_for_llm(a1),
+                        author_side_for_llm(a2),
                     )
                     w, l = (a1, a2) if result["winner"] == "A" else (a2, a1)
                     ratio = result["ratio"].split(":")
