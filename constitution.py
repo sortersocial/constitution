@@ -26,48 +26,41 @@ Run: uv run constitution.py
 from decimal import Decimal, getcontext
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
 import json, time, os, asyncio, httpx, pathlib
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
-from evaleval import event, JsonlStore, to_dict
+from evaleval import event, JsonlStore, to_dict, render, RawContent, Signer, SnippetExecutionError
 
 getcontext().prec = 50
 
 app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=os.environ["SESSION_SECRET"])
+signer = Signer()
 
 # ===========================================================================
 # §1. CONSTANTS — the two free parameters and everything derived from them
 # ===========================================================================
 
-# Free parameter 1: Promethium-145 half-life (Wolfram ElementData)
 HALF_LIFE_YEARS = Decimal("17.72577371892")
 
-# Free parameter 2: epoch duration = 1/12 tropical year (Laskar 1986)
-# Not a constant. Evaluated per epoch. See §2.
-
-# Derived constants
 TOTAL_SUPPLY = Decimal("177600")
 LP_TOKENS = Decimal("1776")
 CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
 EPOCHS_PER_HALFLIFE = HALF_LIFE_YEARS * 12
 DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
 
-GENESIS_MS = int(os.environ["GENESIS_MS"])  # set once, never changed
+GENESIS_MS = int(os.environ["GENESIS_MS"])
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
-# Solana / token config
 SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 MINT_ADDRESS = os.environ.get("MINT_ADDRESS", "")
 TREASURY_ADDRESS = os.environ.get("TREASURY_ADDRESS", "")
 
-# GitHub OAuth
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
-REPO = os.environ.get("REPO", "tommy-mor/slug")  # for commit log
+REPO = os.environ.get("REPO", "tommy-mor/slug")
 
-# OpenRouter
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 
@@ -114,7 +107,6 @@ J2000_UNIX_MS = Decimal("946728000000")
 JULIAN_CENTURY_MS = Decimal("36525") * 86400 * 1000
 DAY_MS = Decimal("86400000")
 
-# Laskar (1986) coefficients for mean tropical year
 A0 = Decimal("365.2421896698")
 A1 = Decimal("-6.15359E-6")
 A2 = Decimal("-7.29E-10")
@@ -122,19 +114,16 @@ A3 = Decimal("2.64E-10")
 
 
 def T_from_unix_ms(ms):
-    """Julian centuries from J2000.0"""
     return (Decimal(ms) - J2000_UNIX_MS) / JULIAN_CENTURY_MS
 
 
 def tropical_epoch_ms(unix_ms):
-    """Duration of one epoch (1/12 tropical year) at a given moment"""
     T = T_from_unix_ms(unix_ms)
     days = A0 + A1 * T + A2 * T**2 + A3 * T**3
     return days * DAY_MS / 12
 
 
 def epoch_boundary(n):
-    """Compute the exact millisecond of epoch boundary n from genesis"""
     boundary = Decimal(GENESIS_MS)
     for e in range(n):
         boundary += tropical_epoch_ms(boundary)
@@ -142,10 +131,9 @@ def epoch_boundary(n):
 
 
 def current_epoch():
-    """Which epoch are we in right now?"""
     now = int(time.time() * 1000)
     boundary = Decimal(GENESIS_MS)
-    for e in range(10000):  # safety limit
+    for e in range(10000):
         next_boundary = boundary + tropical_epoch_ms(boundary)
         if int(round(next_boundary)) > now:
             return e, int(round(boundary)), int(round(next_boundary))
@@ -161,10 +149,6 @@ import numpy as np
 
 
 def rank_centrality(pairs):
-    """
-    pairs: list of (winner_idx, loser_idx, w_ratio, l_ratio)
-    returns: stationary distribution (scores that sum to 1)
-    """
     items = set()
     for w, l, wr, lr in pairs:
         items.add(w)
@@ -209,22 +193,18 @@ def rank_centrality(pairs):
 # ===========================================================================
 
 async def fetch_top_models(n=3):
-    """Query OpenRouter for top recent models"""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             "https://openrouter.ai/api/v1/models",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
         )
         models = resp.json()["data"]
-        # Filter for chat models, sort by creation date, take top n
         chat_models = [m for m in models if "chat" in m.get("id", "")]
-        # TODO: better filtering — by quality rankings, context length, etc.
         chat_models.sort(key=lambda m: m.get("created", 0), reverse=True)
         return [m["id"] for m in chat_models[:n]]
 
 
 def _retry_llm_pairwise(exc: BaseException) -> bool:
-    """Retry transient OpenRouter/network failures and flaky model output."""
     if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -239,7 +219,6 @@ def _retry_llm_pairwise(exc: BaseException) -> bool:
     reraise=True,
 )
 async def llm_pairwise_compare(model_id, side_a, side_b):
-    """Ask one LLM: which author's work (messages + full diffs) weighed more?"""
     prompt = f"""You are ranking contributions to an open source project.
 Compare these two sides (each may be one or more commits). Decide which side contributed more.
 Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
@@ -264,8 +243,7 @@ Side B — unified diffs (full patches):
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
-        result = json.loads(content)
-        return result
+        return json.loads(content)
 
 
 def _github_headers():
@@ -277,7 +255,6 @@ def _github_headers():
 
 
 def unified_diff_from_commit_payload(payload: dict) -> str:
-    """Full textual diff from a GitHub GET /commits/{sha} JSON body (files[].patch)."""
     parts = []
     for f in payload.get("files") or []:
         name = f.get("filename", "?")
@@ -285,14 +262,11 @@ def unified_diff_from_commit_payload(payload: dict) -> str:
         if patch:
             parts.append(f"--- {name}\n{patch}")
         else:
-            parts.append(
-                f"--- {name}\n[no textual patch from GitHub: binary, submodule, or too large]\n"
-            )
+            parts.append(f"--- {name}\n[no textual patch: binary, submodule, or too large]\n")
     return "\n\n".join(parts) if parts else "[no files in API response]"
 
 
 async def fetch_commits_since(since_ms):
-    """Pull commits from the repo since last epoch (SHAs only; no per-file patches)."""
     since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -304,7 +278,6 @@ async def fetch_commits_since(since_ms):
 
 
 async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
-    """One commit's full unified diff via the single-commit API."""
     resp = await client.get(
         f"https://api.github.com/repos/{REPO}/commits/{sha}",
         headers=_github_headers(),
@@ -313,40 +286,28 @@ async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
     return unified_diff_from_commit_payload(resp.json())
 
 
-SSE_CLIENTS = []  # list of asyncio.Queue for live streaming
+SSE_CLIENTS = []
 
 
 async def broadcast_sse(event_type, data):
-    """Send an SSE event to all connected clients"""
     for queue in SSE_CLIENTS:
         await queue.put(f"event: {event_type}\ndata: {json.dumps(data)}\n\n")
 
 
 async def rank_commits(since_ms):
-    """
-    Full commit ranking pipeline:
-    1. Fetch commits since last epoch
-    2. Query OpenRouter for top models
-    3. Do pairwise comparisons across council
-    4. Run rank centrality
-    5. Stream everything via SSE
-    """
     commits = await fetch_commits_since(since_ms)
     if not commits:
         return {}
 
     async with httpx.AsyncClient() as gh:
-        diff_tasks = [fetch_commit_unified_diff(gh, c["sha"]) for c in commits]
-        commit_diffs = await asyncio.gather(*diff_tasks)
+        commit_diffs = await asyncio.gather(*[fetch_commit_unified_diff(gh, c["sha"]) for c in commits])
 
     models = await fetch_top_models(n=3)
     await broadcast_sse("council", {"models": models, "commits": len(commits)})
 
-    # Map commit authors to indices
     authors = list(set(c["commit"]["author"]["name"] for c in commits))
     author_idx = {a: i for i, a in enumerate(authors)}
 
-    # Group commits by author with full unified diff per commit (GitHub files[].patch)
     author_commits = {a: [] for a in authors}
     for c, diff_text in zip(commits, commit_diffs, strict=True):
         author_commits[c["commit"]["author"]["name"]].append({
@@ -355,42 +316,27 @@ async def rank_commits(since_ms):
             "diff": diff_text,
         })
 
-    def author_side_for_llm(author: str) -> dict:
-        lines_msg = []
-        blocks_diff = []
-        for c in author_commits[author]:
-            lines_msg.append(f"[{c['sha']}] {c['message']}")
-            blocks_diff.append(f"=== {c['sha']} ===\n{c['diff']}")
+    def author_side_for_llm(author):
+        cs = author_commits[author]
         return {
-            "message": "\n".join(lines_msg),
-            "diff": "\n\n".join(blocks_diff),
+            "message": "\n".join(f"[{c['sha']}] {c['message']}" for c in cs),
+            "diff": "\n\n".join(f"=== {c['sha']} ===\n{c['diff']}" for c in cs),
         }
 
-    # Pairwise comparisons: each pair of authors, each model votes
     pairs = []
     for i, a1 in enumerate(authors):
         for j, a2 in enumerate(authors):
             if i >= j:
                 continue
             for model in models:
-                await broadcast_sse("comparing", {
-                    "model": model, "a": a1, "b": a2
-                })
+                await broadcast_sse("comparing", {"model": model, "a": a1, "b": a2})
                 try:
-                    result = await llm_pairwise_compare(
-                        model,
-                        author_side_for_llm(a1),
-                        author_side_for_llm(a2),
-                    )
+                    result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
                     w, l = (a1, a2) if result["winner"] == "A" else (a2, a1)
                     ratio = result["ratio"].split(":")
-                    pairs.append((author_idx[w], author_idx[l],
-                                  float(ratio[0]), float(ratio[1])))
-                    await broadcast_sse("vote", {
-                        "model": model, "winner": w, "loser": l,
-                        "ratio": result["ratio"],
-                        "explanation": result["explanation"]
-                    })
+                    pairs.append((author_idx[w], author_idx[l], float(ratio[0]), float(ratio[1])))
+                    await broadcast_sse("vote", {"model": model, "winner": w, "loser": l,
+                                                 "ratio": result["ratio"], "explanation": result["explanation"]})
                 except Exception as e:
                     await broadcast_sse("error", {"model": model, "error": str(e)})
 
@@ -408,39 +354,26 @@ async def rank_commits(since_ms):
 # ===========================================================================
 
 def pool_remaining(events: list) -> Decimal:
-    """Compute current pool balance from a list of events."""
-    emitted = sum(
-        Decimal(e.total_emitted)
-        for e in events
-        if isinstance(e, Emission)
-    )
+    emitted = sum(Decimal(e.total_emitted) for e in events if isinstance(e, Emission))
     return CONTRIBUTOR_POOL - emitted
 
 
 async def run_emission(epoch_n, boundary_ms):
-    """Execute one epoch's emission."""
     await broadcast_sse("emission_start", {"epoch": epoch_n, "boundary_ms": boundary_ms})
 
-    # Snapshot pool before the slow async work
     pool = pool_remaining(store.read())
     emission = pool * DECAY_RATE
     await broadcast_sse("emission_amount", {
-        "pool_before": str(pool),
-        "emission": str(emission),
-        "pool_after": str(pool - emission),
-        "decay_rate": str(DECAY_RATE),
+        "pool_before": str(pool), "emission": str(emission),
+        "pool_after": str(pool - emission), "decay_rate": str(DECAY_RATE),
     })
 
-    # Find the previous epoch boundary for commit window
     prev_boundary_ms = epoch_boundary(epoch_n - 1) if epoch_n > 0 else GENESIS_MS
-
-    # Rank contributors — expensive async work, done outside the write lock
     ranking = await rank_commits(prev_boundary_ms)
 
-    # Atomic check-then-write: recompute pool from fresh state under lock
     def make_emission(events):
         if epoch_n in {e.epoch for e in events if isinstance(e, Emission)}:
-            return None  # already processed (e.g. concurrent trigger)
+            return None
         pool_now = pool_remaining(events)
         emission_now = pool_now * DECAY_RATE
         return Emission(
@@ -452,7 +385,7 @@ async def run_emission(epoch_n, boundary_ms):
             decay_rate=str(DECAY_RATE),
             distributions={a: str(emission_now * s) for a, s in ranking.items()},
             ranking={a: str(s) for a, s in ranking.items()},
-            models_used=[],  # filled during rank_commits
+            models_used=[],
         )
 
     entry = await store.atomic(make_emission)
@@ -466,47 +399,23 @@ async def run_emission(epoch_n, boundary_ms):
 # ===========================================================================
 
 async def query_token_holdings():
-    """§6.1 — Query $SLUG token ownership on Solana"""
-    # TODO: query Solana RPC for token accounts of MINT_ADDRESS
-    # Returns: {wallet_address: Decimal(balance), ...}
     return {}
 
 
-async def query_commit_ranking_diff(since_ms):
-    """§6.2 — Query commit-ranking diff since last epoch"""
-    # This is done in §4 during emission, results stored in ledger
-    pass
-
-
 async def query_treasury_balance():
-    """§6.3 — Query treasury USDC balance"""
-    # TODO: query Solana RPC for USDC balance of TREASURY_ADDRESS
     return Decimal("0")
 
 
 async def distribute_usdc(holdings, treasury_balance):
-    """§6.4 — Distribute USDC to all $SLUG holders proportionally
-    The contributor pool's share flows through to contributors by score.
-    """
-    if treasury_balance == 0:
+    if treasury_balance == 0 or not holdings:
         return
-
-    total_supply_held = sum(holdings.values())
-    if total_supply_held == 0:
-        return
-
-    distributions = {
-        wallet: str(treasury_balance * balance / total_supply_held)
-        for wallet, balance in holdings.items()
-    }
-
+    total = sum(holdings.values())
     entry = UsdcDistribution(
         timestamp_ms=int(time.time() * 1000),
         treasury_balance=str(treasury_balance),
-        distributions=distributions,
+        distributions={w: str(treasury_balance * b / total) for w, b in holdings.items()},
     )
     await store.append(entry)
-    # TODO: execute Solana transfers
     return entry
 
 
@@ -515,64 +424,50 @@ async def distribute_usdc(holdings, treasury_balance):
 # ===========================================================================
 
 async def epoch_loop():
-    """Background task: check for epoch boundaries, sleep until exact ms"""
     while True:
         epoch_n, current_start, next_boundary = current_epoch()
         now = int(time.time() * 1000)
         wait_ms = next_boundary - now
 
         if wait_ms <= 0:
-            # Epoch boundary has passed, check if we already processed it
             processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
             if epoch_n not in processed and epoch_n >= 0:
                 await run_emission(epoch_n, current_start)
-            await asyncio.sleep(60)  # check again in a minute
-
-        elif wait_ms < 86_400_000:  # within 24 hours
+            await asyncio.sleep(60)
+        elif wait_ms < 86_400_000:
             await broadcast_sse("waiting", {
                 "next_epoch": epoch_n + 1,
                 "boundary_ms": next_boundary,
                 "wait_seconds": wait_ms / 1000,
             })
-            # Sleep until the exact millisecond
             await asyncio.sleep(wait_ms / 1000)
             await run_emission(epoch_n + 1, next_boundary)
-
         else:
-            # More than 24 hours away, check again in an hour
             await asyncio.sleep(3600)
 
 
 # ===========================================================================
-# §8. API — read the ledger, query state
+# §8. API — 2-line read forwards + computed endpoints
 # ===========================================================================
 
 @app.get("/api/ledger")
 async def get_ledger(offset: int = 0, limit: int = 100):
-    """Full ledger, paginated. Passwords and secrets are never in the JSONL."""
-    events = store.read()
-    return [to_dict(e) for e in events[offset : offset + limit]]
+    return [to_dict(e) for e in store.read()[offset:offset + limit]]
 
 
 @app.get("/api/epoch")
 async def get_epoch():
-    """Current epoch info"""
     epoch_n, start, next_b = current_epoch()
     pool = pool_remaining(store.read())
     return {
-        "epoch": epoch_n,
-        "start_ms": start,
-        "next_boundary_ms": next_b,
-        "pool_remaining": str(pool),
-        "pool_pct": str(pool / CONTRIBUTOR_POOL * 100),
-        "total_emitted": str(CONTRIBUTOR_POOL - pool),
-        "decay_rate_per_epoch": str(DECAY_RATE),
+        "epoch": epoch_n, "start_ms": start, "next_boundary_ms": next_b,
+        "pool_remaining": str(pool), "pool_pct": str(pool / CONTRIBUTOR_POOL * 100),
+        "total_emitted": str(CONTRIBUTOR_POOL - pool), "decay_rate_per_epoch": str(DECAY_RATE),
     }
 
 
 @app.get("/api/ranking")
 async def get_ranking():
-    """Current contributor rankings from most recent emission"""
     emissions = [e for e in store.read() if isinstance(e, Emission)]
     if not emissions:
         return {"ranking": {}, "epoch": -1}
@@ -582,22 +477,16 @@ async def get_ranking():
 
 @app.get("/api/contributor/{github_username}")
 async def get_contributor(github_username: str):
-    """A contributor's full history: emissions received, rank per epoch"""
-    history = []
-    for e in store.read():
-        if isinstance(e, Emission) and github_username in e.distributions:
-            history.append({
-                "epoch": e.epoch,
-                "amount": e.distributions[github_username],
-                "rank_score": e.ranking.get(github_username),
-            })
-    total = sum(Decimal(h["amount"]) for h in history)
-    return {"contributor": github_username, "total_earned": str(total), "history": history}
+    history = [
+        {"epoch": e.epoch, "amount": e.distributions[github_username], "rank_score": e.ranking.get(github_username)}
+        for e in store.read()
+        if isinstance(e, Emission) and github_username in e.distributions
+    ]
+    return {"contributor": github_username, "total_earned": str(sum(Decimal(h["amount"]) for h in history)), "history": history}
 
 
 @app.get("/api/halvening")
 async def get_halvening():
-    """When does the pool cross 50%? The jubilee."""
     boundary = Decimal(GENESIS_MS)
     elapsed_years = Decimal("0")
     for e in range(300):
@@ -607,23 +496,25 @@ async def get_halvening():
             fraction = (HALF_LIFE_YEARS - elapsed_years) / epoch_years
             jubilee_ms = int(boundary + fraction * epoch_dur)
             dt = datetime.fromtimestamp(jubilee_ms / 1000, tz=timezone.utc)
-            return {
-                "jubilee_ms": jubilee_ms,
-                "jubilee_utc": dt.isoformat(),
-                "epoch": e + float(fraction),
-                "half_life_years": str(HALF_LIFE_YEARS),
-            }
+            return {"jubilee_ms": jubilee_ms, "jubilee_utc": dt.isoformat(),
+                    "epoch": e + float(fraction), "half_life_years": str(HALF_LIFE_YEARS)}
         elapsed_years += epoch_years
         boundary += epoch_dur
 
 
 # ===========================================================================
 # §9. SSE — live audit stream of the pairwise voting process
+#
+# TODO: the /sse emission audit page needs a real SSE-driven UI. votes arrive
+# incrementally during rank_commits(), and the client should show a live
+# progress bar and per-vote results as they stream in. this requires a
+# dedicated page that connects to /sse and updates the DOM on each event
+# (council, comparing, vote, ranking, emission_complete). defer until we
+# have playwright tests to cover it — the incremental rendering is fiddly.
 # ===========================================================================
 
 @app.get("/sse")
 async def sse_stream(request: Request):
-    """Server-sent events stream. Watch the emission process live."""
     queue = asyncio.Queue()
     SSE_CLIENTS.append(queue)
 
@@ -646,43 +537,103 @@ async def sse_stream(request: Request):
 
 
 # ===========================================================================
-# §10. REDEMPTION UI — GitHub OAuth + evaleval
+# §10. UI — hiccup pages + signed snippet POST handler
 # ===========================================================================
 
-# TODO: import evaleval Signer, Three, Two, Selector, MORPH, APPEND, etc.
-# For now, sketch the flow:
+_FORM_INTERCEPT_JS = """
+document.addEventListener('submit', async e => {
+    e.preventDefault();
+    const r = await fetch('/', {method: 'POST', body: new FormData(e.target)});
+    const js = await r.text();
+    if (js.trim()) eval(js);
+});
+"""
+
+def _page(title: str, body: list) -> HTMLResponse:
+    return HTMLResponse(render(["html",
+        ["head",
+            ["meta", {"charset": "utf-8"}],
+            ["meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+            ["title", title],
+        ],
+        ["body",
+            body,
+            ["script", RawContent(_FORM_INTERCEPT_JS)],
+        ],
+    ]))
+
+
+async def redeem(github_user: str, wallet_address: str):
+    await store.append(Redemption(
+        timestamp_ms=int(time.time() * 1000),
+        github_user=github_user,
+        wallet_address=wallet_address,
+        amount="0",  # TODO: compute unclaimed, execute Solana transfer
+    ))
+    return PlainTextResponse("location.reload()")
+
 
 @app.get("/")
 async def index(request: Request):
-    """Landing page — login or show dashboard"""
     user = request.session.get("github_user")
     if not user:
-        return PlainTextResponse(f"""
-<html><body>
-<h1>slug constitution</h1>
-<p>177,600 tokens. $1 each. Promethium half-life. Laskar polynomial epochs.</p>
-<a href="/login">Login with GitHub to check your emissions</a>
-<br><br>
-<a href="/sse">Watch the emission process live</a>
-<br>
-<a href="/api/epoch">Current epoch</a> |
-<a href="/api/ledger">Full ledger</a> |
-<a href="/api/halvening">Jubilee countdown</a>
-</body></html>
-""", media_type="text/html")
+        return _page("slug constitution", ["div",
+            ["h1", "slug constitution"],
+            ["p", "177,600 tokens. $1 each. Promethium half-life. Laskar polynomial epochs."],
+            ["p", ["a", {"href": "/login"}, "Login with GitHub to check your emissions"]],
+            ["p",
+                ["a", {"href": "/sse"}, "Watch emission process live"], " | ",
+                ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
+                ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
+                ["a", {"href": "/api/halvening"}, "Jubilee countdown"],
+            ],
+        ])
 
-    # Logged in — show dashboard with evaleval
-    # TODO: evaleval signed snippets for:
-    #   - Show contributor rank & score
-    #   - Show unclaimed emissions
-    #   - Redemption form: paste Solana wallet, submit
-    #   - SSE viewer for live emission audit
-    return PlainTextResponse(f"Welcome {user}. Dashboard TODO.", media_type="text/html")
+    events = store.read()
+    history = [e for e in events if isinstance(e, Emission) and user in e.distributions]
+    total_earned = sum(Decimal(e.distributions[user]) for e in history)
+    emissions = [e for e in events if isinstance(e, Emission)]
+    latest_rank = emissions[-1].ranking.get(user) if emissions else None
 
+    redeem_form = ["form", {"method": "post"},
+        *signer.snippet_hidden(f"redeem({json.dumps(user)}, $wallet_address)"),
+        ["input", {"name": "wallet_address", "placeholder": "Solana wallet address", "required": "true"}],
+        ["button", {"type": "submit"}, "Redeem"],
+    ]
+
+    return _page(f"slug — {user}", ["div",
+        ["h1", f"Welcome, {user}"],
+        ["p", f"Total earned: {total_earned:.6f} SLUG"],
+        ["p", f"Latest rank score: {latest_rank or 'no emissions yet'}"],
+        ["h2", "Redeem to Solana wallet"],
+        redeem_form,
+        ["p",
+            ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
+            ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
+            ["a", {"href": "/sse"}, "Watch emission live"],
+        ],
+    ])
+
+
+@app.post("/")
+async def do(request: Request):
+    form = await request.form()
+    try:
+        snippet = signer.verify_snippet(form)
+        result = eval(snippet)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
+    except SnippetExecutionError as e:
+        return PlainTextResponse(e.message, status_code=e.status_code)
+
+
+# ===========================================================================
+# §11. OAUTH — GitHub login
+# ===========================================================================
 
 @app.get("/login")
 async def login():
-    """Redirect to GitHub OAuth"""
     return Response(
         status_code=302,
         headers={"Location": f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&scope=read:user"},
@@ -691,15 +642,10 @@ async def login():
 
 @app.get("/callback")
 async def callback(request: Request, code: str):
-    """GitHub OAuth callback"""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://github.com/login/oauth/access_token",
-            json={
-                "client_id": GITHUB_CLIENT_ID,
-                "client_secret": GITHUB_CLIENT_SECRET,
-                "code": code,
-            },
+            json={"client_id": GITHUB_CLIENT_ID, "client_secret": GITHUB_CLIENT_SECRET, "code": code},
             headers={"Accept": "application/json"},
         )
         token = resp.json().get("access_token")
@@ -707,41 +653,16 @@ async def callback(request: Request, code: str):
             "https://api.github.com/user",
             headers={"Authorization": f"Bearer {token}"},
         )
-        user = user_resp.json()
-        request.session["github_user"] = user["login"]
+        request.session["github_user"] = user_resp.json()["login"]
     return Response(status_code=302, headers={"Location": "/"})
 
 
-@app.post("/redeem")
-async def redeem(request: Request):
-    """Redeem unclaimed emissions to a Solana wallet"""
-    user = request.session.get("github_user")
-    if not user:
-        return PlainTextResponse("Not logged in", status_code=401)
-
-    form = await request.form()
-    wallet = form.get("wallet_address")
-    if not wallet:
-        return PlainTextResponse("No wallet address", status_code=400)
-
-    # TODO: compute unclaimed emissions for this user
-    # TODO: execute Solana transfer
-    entry = await store.append(Redemption(
-        timestamp_ms=int(time.time() * 1000),
-        github_user=user,
-        wallet_address=str(wallet),
-        amount="0",  # TODO
-    ))
-    return PlainTextResponse(f"Redeemed to {wallet}. Entry appended to ledger.")
-
-
 # ===========================================================================
-# §11. STARTUP
+# §12. STARTUP
 # ===========================================================================
 
 @app.on_event("startup")
 async def startup():
-    """Start the epoch timer background task"""
     asyncio.create_task(epoch_loop())
 
 
