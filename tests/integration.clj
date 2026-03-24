@@ -272,6 +272,7 @@
        "ALLOW_TEST_TRIGGERS"  "1"
        "OPENROUTER_BASE_URL"  (str "http://127.0.0.1:" or-port)
        "GITHUB_API_BASE_URL"  (str "http://127.0.0.1:" gh-port)
+       "SLUG_MODEL_RANK_PARENT" ""
        "PATH"                 (get (into {} (System/getenv)) "PATH" "")})
 
     (bind !server  (atom nil))

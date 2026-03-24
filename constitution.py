@@ -62,6 +62,14 @@ GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 REPO = os.environ.get("REPO", "tommy-mor/slug")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai").rstrip("/")
+GITHUB_API_BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/")
+
+# Council model IDs: slug.social garden rank under this parent (bodies = OpenRouter URLs), then top-up from OpenRouter list.
+SLUG_SOCIAL_BASE_URL = os.environ.get("SLUG_SOCIAL_BASE_URL", "https://slug.social").rstrip("/")
+SLUG_MODEL_RANK_PARENT = os.environ.get(
+    "SLUG_MODEL_RANK_PARENT", "slug/token/commit-ranking/model"
+).strip()
 
 
 # ===========================================================================
@@ -294,16 +302,108 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
 # The LLMs don't decide what gets merged; they only price what the BDFL accepts.
 # ===========================================================================
 
+def _openrouter_id_from_item_body(body: str) -> str | None:
+    """Item body is often `https://openrouter.ai/<provider>/<model>`."""
+    if not body:
+        return None
+    b = body.strip()
+    for prefix in ("https://openrouter.ai/", "http://openrouter.ai/"):
+        if b.startswith(prefix):
+            return b[len(prefix) :].strip().strip("/") or None
+    return None
+
+
+async def _slug_item_body(client: httpx.AsyncClient, item_path: str) -> str | None:
+    p = item_path.lstrip("/")
+    r = await client.get(f"{SLUG_SOCIAL_BASE_URL}/api/v0/item", params={"item": p})
+    if r.status_code != 200:
+        return None
+    return r.json().get("body")
+
+
+async def _fetch_models_from_slug_rank_parent(
+    client: httpx.AsyncClient, parent: str, n: int
+) -> list[str]:
+    r = await client.get(
+        f"{SLUG_SOCIAL_BASE_URL}/api/v0/rank", params={"parent": parent}
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("ok") is False:
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    ranked_rows: list[tuple[float, str]] = []
+    for comp in data.get("components") or []:
+        for row in comp.get("ranking") or []:
+            ranked_rows.append((float(row["score"]), row["item"]))
+    ranked_rows.sort(key=lambda x: -x[0])
+
+    for _, item_path in ranked_rows:
+        body = await _slug_item_body(client, item_path)
+        oid = _openrouter_id_from_item_body(body or "")
+        if oid and oid not in seen:
+            seen.add(oid)
+            out.append(oid)
+            if len(out) >= n:
+                return out
+
+    for item_path in data.get("unranked_items") or []:
+        body = await _slug_item_body(client, item_path)
+        oid = _openrouter_id_from_item_body(body or "")
+        if oid and oid not in seen:
+            seen.add(oid)
+            out.append(oid)
+            if len(out) >= n:
+                break
+    return out
+
+
+async def _fetch_models_openrouter_only(
+    client: httpx.AsyncClient, n: int, exclude: set[str]
+) -> list[str]:
+    key = (OPENROUTER_API_KEY or "").strip()
+    if not key or n <= 0:
+        return []
+    resp = await client.get(
+        f"{OPENROUTER_BASE_URL}/api/v1/models",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    resp.raise_for_status()
+    models = resp.json()["data"]
+    chat_models = [m for m in models if "chat" in m.get("id", "")]
+    chat_models.sort(key=lambda m: m.get("created", 0), reverse=True)
+    out = []
+    for m in chat_models:
+        mid = m["id"]
+        if mid in exclude:
+            continue
+        out.append(mid)
+        if len(out) >= n:
+            break
+    return out
+
+
 async def fetch_top_models(n=3):
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-        )
-        models = resp.json()["data"]
-        chat_models = [m for m in models if "chat" in m.get("id", "")]
-        chat_models.sort(key=lambda m: m.get("created", 0), reverse=True)
-        return [m["id"] for m in chat_models[:n]]
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=15.0)
+    ) as client:
+        got: list[str] = []
+        if SLUG_MODEL_RANK_PARENT:
+            try:
+                got = await _fetch_models_from_slug_rank_parent(
+                    client, SLUG_MODEL_RANK_PARENT, n
+                )
+            except Exception:
+                got = []
+        if len(got) < n and (OPENROUTER_API_KEY or "").strip():
+            rest = await _fetch_models_openrouter_only(
+                client, n - len(got), exclude=set(got)
+            )
+            got.extend(rest)
+        return got[:n]
 
 
 def _retry_llm_pairwise(exc: BaseException) -> bool:
@@ -339,7 +439,7 @@ Side B — unified diffs (full patches):
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
         resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            f"{OPENROUTER_BASE_URL}/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
         )
@@ -372,7 +472,7 @@ async def fetch_commits_since(since_ms):
     since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"https://api.github.com/repos/{REPO}/commits",
+            f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits",
             params={"since": since_iso, "per_page": 100},
             headers=_github_headers(),
         )
@@ -381,7 +481,7 @@ async def fetch_commits_since(since_ms):
 
 async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
     resp = await client.get(
-        f"https://api.github.com/repos/{REPO}/commits/{sha}",
+        f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits/{sha}",
         headers=_github_headers(),
     )
     resp.raise_for_status()
@@ -608,6 +708,19 @@ async def get_halvening():
         boundary += epoch_dur
 
 
+@app.post("/test/emit")
+async def test_emit():
+    """Integration tests only: run the next unprocessed emission."""
+    if os.environ.get("ALLOW_TEST_TRIGGERS") != "1":
+        return Response(status_code=404)
+    processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
+    n = 0
+    while n in processed:
+        n += 1
+    entry = await run_emission(n, epoch_boundary(n))
+    return to_dict(entry) if entry else {"ok": False, "error": "no emission appended"}
+
+
 # ===========================================================================
 # §9. SSE — live audit stream of the pairwise voting process
 #
@@ -756,7 +869,7 @@ async def callback(request: Request, code: str):
         )
         token = resp.json().get("access_token")
         user_resp = await client.get(
-            "https://api.github.com/user",
+            f"{GITHUB_API_BASE_URL}/user",
             headers={"Authorization": f"Bearer {token}"},
         )
         request.session["github_user"] = user_resp.json()["login"]
@@ -769,7 +882,8 @@ async def callback(request: Request, code: str):
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(epoch_loop())
+    if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
+        asyncio.create_task(epoch_loop())
 
 
 if __name__ == "__main__":
