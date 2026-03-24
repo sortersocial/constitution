@@ -28,8 +28,9 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from starlette.middleware.sessions import SessionMiddleware
-import json, time, os, asyncio, hashlib, hmac, httpx, pathlib, threading
+import json, time, os, asyncio, httpx, pathlib
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from evaleval import event, JsonlStore, to_dict
 
 getcontext().prec = 50
 
@@ -66,12 +67,43 @@ GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 REPO = os.environ.get("REPO", "tommy-mor/slug")  # for commit log
 
-# OpenRouter (override base URL for integration tests against a mock)
+# OpenRouter
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai").rstrip("/")
 
-# GitHub REST API (override for mocks; OAuth still uses github.com)
-GITHUB_API_BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/")
+
+# ===========================================================================
+# §1b. LEDGER SCHEMA — typed events
+# ===========================================================================
+
+@event
+class Emission:
+    epoch: int
+    timestamp_ms: int
+    pool_before: str
+    total_emitted: str
+    pool_after: str
+    decay_rate: str
+    distributions: dict   # author -> amount str
+    ranking: dict         # author -> score str
+    models_used: list
+
+
+@event
+class UsdcDistribution:
+    timestamp_ms: int
+    treasury_balance: str
+    distributions: dict   # wallet -> amount str
+
+
+@event
+class Redemption:
+    timestamp_ms: int
+    github_user: str
+    wallet_address: str
+    amount: str
+
+
+store = JsonlStore(JSONL_PATH)
 
 
 # ===========================================================================
@@ -167,7 +199,7 @@ def rank_centrality(pairs):
 # Because the LLM council reads raw commit messages and full unified diffs
 # (code, comments, strings in the patch), the system is technically vulnerable
 # to prompt injection (e.g., instructions in commit messages or in diff text).
-# 
+#
 # The defense mechanism against this is the Benevolent Dictator For Life (BDFL)
 # of the repository. Commits with injected prompts simply will not be merged.
 # While relying on human curation might seem to contradict "decentralization,"
@@ -180,7 +212,7 @@ async def fetch_top_models(n=3):
     """Query OpenRouter for top recent models"""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{OPENROUTER_BASE_URL}/api/v1/models",
+            "https://openrouter.ai/api/v1/models",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
         )
         models = resp.json()["data"]
@@ -226,7 +258,7 @@ Side B — unified diffs (full patches):
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
         resp = await client.post(
-            f"{OPENROUTER_BASE_URL}/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
         )
@@ -264,7 +296,7 @@ async def fetch_commits_since(since_ms):
     since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits",
+            f"https://api.github.com/repos/{REPO}/commits",
             params={"since": since_iso, "per_page": 100},
             headers=_github_headers(),
         )
@@ -274,7 +306,7 @@ async def fetch_commits_since(since_ms):
 async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
     """One commit's full unified diff via the single-commit API."""
     resp = await client.get(
-        f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits/{sha}",
+        f"https://api.github.com/repos/{REPO}/commits/{sha}",
         headers=_github_headers(),
     )
     resp.raise_for_status()
@@ -375,35 +407,22 @@ async def rank_commits(since_ms):
 # §5. EMISSION — the pool decays, contributors receive
 # ===========================================================================
 
-def read_ledger():
-    """Read the full JSONL ledger"""
-    if not JSONL_PATH.exists():
-        return []
-    with open(JSONL_PATH) as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-
-def append_ledger(entry):
-    """Append one entry to the JSONL ledger"""
-    with open(JSONL_PATH, "a") as f:
-        f.write(json.dumps(entry, default=str) + "\n")
-
-
-def pool_remaining():
-    """Compute current pool balance from ledger"""
+def pool_remaining(events: list) -> Decimal:
+    """Compute current pool balance from a list of events."""
     emitted = sum(
-        Decimal(str(e["total_emitted"]))
-        for e in read_ledger()
-        if e["type"] == "emission"
+        Decimal(e.total_emitted)
+        for e in events
+        if isinstance(e, Emission)
     )
     return CONTRIBUTOR_POOL - emitted
 
 
 async def run_emission(epoch_n, boundary_ms):
-    """Execute one epoch's emission"""
+    """Execute one epoch's emission."""
     await broadcast_sse("emission_start", {"epoch": epoch_n, "boundary_ms": boundary_ms})
 
-    pool = pool_remaining()
+    # Snapshot pool before the slow async work
+    pool = pool_remaining(store.read())
     emission = pool * DECAY_RATE
     await broadcast_sse("emission_amount", {
         "pool_before": str(pool),
@@ -415,29 +434,30 @@ async def run_emission(epoch_n, boundary_ms):
     # Find the previous epoch boundary for commit window
     prev_boundary_ms = epoch_boundary(epoch_n - 1) if epoch_n > 0 else GENESIS_MS
 
-    # Rank contributors for this epoch
+    # Rank contributors — expensive async work, done outside the write lock
     ranking = await rank_commits(prev_boundary_ms)
 
-    # Distribute emission by ranking scores
-    distributions = {}
-    for author, score in ranking.items():
-        amount = emission * score
-        distributions[author] = str(amount)
+    # Atomic check-then-write: recompute pool from fresh state under lock
+    def make_emission(events):
+        if epoch_n in {e.epoch for e in events if isinstance(e, Emission)}:
+            return None  # already processed (e.g. concurrent trigger)
+        pool_now = pool_remaining(events)
+        emission_now = pool_now * DECAY_RATE
+        return Emission(
+            epoch=epoch_n,
+            timestamp_ms=boundary_ms,
+            pool_before=str(pool_now),
+            total_emitted=str(emission_now),
+            pool_after=str(pool_now - emission_now),
+            decay_rate=str(DECAY_RATE),
+            distributions={a: str(emission_now * s) for a, s in ranking.items()},
+            ranking={a: str(s) for a, s in ranking.items()},
+            models_used=[],  # filled during rank_commits
+        )
 
-    entry = {
-        "type": "emission",
-        "epoch": epoch_n,
-        "timestamp_ms": boundary_ms,
-        "pool_before": str(pool),
-        "total_emitted": str(emission),
-        "pool_after": str(pool - emission),
-        "decay_rate": str(DECAY_RATE),
-        "distributions": distributions,
-        "ranking": {a: str(s) for a, s in ranking.items()},
-        "models_used": [],  # filled during rank_commits
-    }
-    append_ledger(entry)
-    await broadcast_sse("emission_complete", entry)
+    entry = await store.atomic(make_emission)
+    if entry:
+        await broadcast_sse("emission_complete", to_dict(entry))
     return entry
 
 
@@ -475,19 +495,17 @@ async def distribute_usdc(holdings, treasury_balance):
     if total_supply_held == 0:
         return
 
-    distributions = {}
-    for wallet, balance in holdings.items():
-        share = balance / total_supply_held
-        usdc_amount = treasury_balance * share
-        distributions[wallet] = str(usdc_amount)
-
-    entry = {
-        "type": "usdc_distribution",
-        "timestamp_ms": int(time.time() * 1000),
-        "treasury_balance": str(treasury_balance),
-        "distributions": distributions,
+    distributions = {
+        wallet: str(treasury_balance * balance / total_supply_held)
+        for wallet, balance in holdings.items()
     }
-    append_ledger(entry)
+
+    entry = UsdcDistribution(
+        timestamp_ms=int(time.time() * 1000),
+        treasury_balance=str(treasury_balance),
+        distributions=distributions,
+    )
+    await store.append(entry)
     # TODO: execute Solana transfers
     return entry
 
@@ -505,9 +523,8 @@ async def epoch_loop():
 
         if wait_ms <= 0:
             # Epoch boundary has passed, check if we already processed it
-            ledger = read_ledger()
-            processed_epochs = {e["epoch"] for e in ledger if e["type"] == "emission"}
-            if epoch_n not in processed_epochs and epoch_n >= 0:
+            processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
+            if epoch_n not in processed and epoch_n >= 0:
                 await run_emission(epoch_n, current_start)
             await asyncio.sleep(60)  # check again in a minute
 
@@ -533,15 +550,15 @@ async def epoch_loop():
 @app.get("/api/ledger")
 async def get_ledger(offset: int = 0, limit: int = 100):
     """Full ledger, paginated. Passwords and secrets are never in the JSONL."""
-    ledger = read_ledger()
-    return ledger[offset : offset + limit]
+    events = store.read()
+    return [to_dict(e) for e in events[offset : offset + limit]]
 
 
 @app.get("/api/epoch")
 async def get_epoch():
     """Current epoch info"""
     epoch_n, start, next_b = current_epoch()
-    pool = pool_remaining()
+    pool = pool_remaining(store.read())
     return {
         "epoch": epoch_n,
         "start_ms": start,
@@ -556,27 +573,24 @@ async def get_epoch():
 @app.get("/api/ranking")
 async def get_ranking():
     """Current contributor rankings from most recent emission"""
-    ledger = read_ledger()
-    emissions = [e for e in ledger if e["type"] == "emission"]
+    emissions = [e for e in store.read() if isinstance(e, Emission)]
     if not emissions:
         return {"ranking": {}, "epoch": -1}
     latest = emissions[-1]
-    return {"ranking": latest["ranking"], "epoch": latest["epoch"]}
+    return {"ranking": latest.ranking, "epoch": latest.epoch}
 
 
 @app.get("/api/contributor/{github_username}")
 async def get_contributor(github_username: str):
     """A contributor's full history: emissions received, rank per epoch"""
-    ledger = read_ledger()
     history = []
-    for entry in ledger:
-        if entry["type"] == "emission":
-            if github_username in entry.get("distributions", {}):
-                history.append({
-                    "epoch": entry["epoch"],
-                    "amount": entry["distributions"][github_username],
-                    "rank_score": entry["ranking"].get(github_username),
-                })
+    for e in store.read():
+        if isinstance(e, Emission) and github_username in e.distributions:
+            history.append({
+                "epoch": e.epoch,
+                "amount": e.distributions[github_username],
+                "rank_score": e.ranking.get(github_username),
+            })
     total = sum(Decimal(h["amount"]) for h in history)
     return {"contributor": github_username, "total_earned": str(total), "history": history}
 
@@ -601,20 +615,6 @@ async def get_halvening():
             }
         elapsed_years += epoch_years
         boundary += epoch_dur
-
-
-@app.post("/test/emit")
-async def test_emit():
-    """Run the next unprocessed emission (integration tests only)."""
-    if os.environ.get("ALLOW_TEST_TRIGGERS") != "1":
-        return Response(status_code=404)
-    ledger = read_ledger()
-    processed = {e["epoch"] for e in ledger if e["type"] == "emission"}
-    n = 0
-    while n in processed:
-        n += 1
-    entry = await run_emission(n, epoch_boundary(n))
-    return entry
 
 
 # ===========================================================================
@@ -704,7 +704,7 @@ async def callback(request: Request, code: str):
         )
         token = resp.json().get("access_token")
         user_resp = await client.get(
-            f"{GITHUB_API_BASE_URL}/user",
+            "https://api.github.com/user",
             headers={"Authorization": f"Bearer {token}"},
         )
         user = user_resp.json()
@@ -726,16 +726,12 @@ async def redeem(request: Request):
 
     # TODO: compute unclaimed emissions for this user
     # TODO: execute Solana transfer
-    # TODO: append redemption to JSONL
-
-    entry = {
-        "type": "redemption",
-        "timestamp_ms": int(time.time() * 1000),
-        "github_user": user,
-        "wallet_address": wallet,
-        "amount": "0",  # TODO
-    }
-    append_ledger(entry)
+    entry = await store.append(Redemption(
+        timestamp_ms=int(time.time() * 1000),
+        github_user=user,
+        wallet_address=str(wallet),
+        amount="0",  # TODO
+    ))
     return PlainTextResponse(f"Redeemed to {wallet}. Entry appended to ledger.")
 
 
@@ -746,8 +742,7 @@ async def redeem(request: Request):
 @app.on_event("startup")
 async def startup():
     """Start the epoch timer background task"""
-    if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
-        asyncio.create_task(epoch_loop())
+    asyncio.create_task(epoch_loop())
 
 
 if __name__ == "__main__":
