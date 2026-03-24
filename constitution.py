@@ -10,6 +10,7 @@
 #   "authlib",
 #   "itsdangerous",
 #   "starlette",
+#   "numpy",
 # ]
 # ///
 """
@@ -65,8 +66,12 @@ GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 REPO = os.environ.get("REPO", "tommy-mor/slug")  # for commit log
 
-# OpenRouter
+# OpenRouter (override base URL for integration tests against a mock)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai").rstrip("/")
+
+# GitHub REST API (override for mocks; OAuth still uses github.com)
+GITHUB_API_BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/")
 
 
 # ===========================================================================
@@ -175,7 +180,7 @@ async def fetch_top_models(n=3):
     """Query OpenRouter for top recent models"""
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            "https://openrouter.ai/api/v1/models",
+            f"{OPENROUTER_BASE_URL}/api/v1/models",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
         )
         models = resp.json()["data"]
@@ -221,7 +226,7 @@ Side B — unified diffs (full patches):
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
         resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            f"{OPENROUTER_BASE_URL}/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
         )
@@ -259,7 +264,7 @@ async def fetch_commits_since(since_ms):
     since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"https://api.github.com/repos/{REPO}/commits",
+            f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits",
             params={"since": since_iso, "per_page": 100},
             headers=_github_headers(),
         )
@@ -269,7 +274,7 @@ async def fetch_commits_since(since_ms):
 async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
     """One commit's full unified diff via the single-commit API."""
     resp = await client.get(
-        f"https://api.github.com/repos/{REPO}/commits/{sha}",
+        f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits/{sha}",
         headers=_github_headers(),
     )
     resp.raise_for_status()
@@ -598,6 +603,20 @@ async def get_halvening():
         boundary += epoch_dur
 
 
+@app.post("/test/emit")
+async def test_emit():
+    """Run the next unprocessed emission (integration tests only)."""
+    if os.environ.get("ALLOW_TEST_TRIGGERS") != "1":
+        return Response(status_code=404)
+    ledger = read_ledger()
+    processed = {e["epoch"] for e in ledger if e["type"] == "emission"}
+    n = 0
+    while n in processed:
+        n += 1
+    entry = await run_emission(n, epoch_boundary(n))
+    return entry
+
+
 # ===========================================================================
 # §9. SSE — live audit stream of the pairwise voting process
 # ===========================================================================
@@ -685,7 +704,7 @@ async def callback(request: Request, code: str):
         )
         token = resp.json().get("access_token")
         user_resp = await client.get(
-            "https://api.github.com/user",
+            f"{GITHUB_API_BASE_URL}/user",
             headers={"Authorization": f"Bearer {token}"},
         )
         user = user_resp.json()
@@ -727,7 +746,8 @@ async def redeem(request: Request):
 @app.on_event("startup")
 async def startup():
     """Start the epoch timer background task"""
-    asyncio.create_task(epoch_loop())
+    if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
+        asyncio.create_task(epoch_loop())
 
 
 if __name__ == "__main__":
