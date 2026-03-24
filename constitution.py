@@ -5,6 +5,7 @@
 #   "fastapi",
 #   "uvicorn",
 #   "httpx",
+#   "tenacity",
 #   "evaleval",
 #   "authlib",
 #   "itsdangerous",
@@ -27,6 +28,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from starlette.middleware.sessions import SessionMiddleware
 import json, time, os, asyncio, hashlib, hmac, httpx, pathlib, threading
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 getcontext().prec = 50
 
@@ -184,6 +186,21 @@ async def fetch_top_models(n=3):
         return [m["id"] for m in chat_models[:n]]
 
 
+def _retry_llm_pairwise(exc: BaseException) -> bool:
+    """Retry transient OpenRouter/network failures and flaky model output."""
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (408, 425, 429, 500, 502, 503, 504)
+    return isinstance(exc, httpx.RequestError)
+
+
+@retry(
+    retry=retry_if_exception(_retry_llm_pairwise),
+    stop=stop_after_attempt(6),
+    wait=wait_exponential(multiplier=1, min=1, max=120),
+    reraise=True,
+)
 async def llm_pairwise_compare(model_id, side_a, side_b):
     """Ask one LLM: which author's work (messages + full diffs) weighed more?"""
     prompt = f"""You are ranking contributions to an open source project.
@@ -202,13 +219,13 @@ Side B — commit messages:
 Side B — unified diffs (full patches):
 {side_b['diff']}"""
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
         resp = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
             json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
         )
-        # Parse response, extract winner and ratio
+        resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
         result = json.loads(content)
         return result
