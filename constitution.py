@@ -53,10 +53,7 @@ LP_USDC = Decimal("1331") # Mathew 13:31
 FDV = Decimal("177600") # begins small
 
 
-def sympy_to_decimal(expr) -> Decimal:
-    num, den = expr.as_numer_denom()
-    return Decimal(str(num)) / Decimal(str(den))
-
+# inputs
 supply, lp_usdc, fdv = sp.symbols("supply lp_usdc fdv", positive=True)
 
 # free
@@ -77,7 +74,7 @@ solution = sp.solve(equations, [price, lp_tokens, lp_pct], dict=True)[0]
 # Algebraic identities that must follow from the solved system.
 assert sp.simplify(solution[price] - (fdv / supply)) == 0, "price must equal fdv / supply"
 assert sp.simplify(solution[lp_pct] - (lp_usdc / fdv)) == 0, "lp_pct must equal lp_usdc / fdv"
-assert sp.simplify(solution[lp_tokens] - (lp_pct * supply)) == 0, "lp_tokens must equal lp_pct * supply"
+assert sp.simplify(solution[lp_tokens] - (solution[lp_pct] * supply)) == 0, "lp_tokens must equal lp_pct * supply"
 
 # Instantiate the constitutional choices exactly.
 instantiated = {
@@ -96,11 +93,22 @@ assert solved["price"] == sp.Integer(177600), "constitutional price mismatch"
 assert solved["lp_pct"] == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
 assert solved["lp_tokens"] == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
 
+
+def sympy_to_decimal(expr) -> Decimal:
+    num, den = expr.as_numer_denom()
+    return Decimal(str(num)) / Decimal(str(den))
+
+
 PRICE = sympy_to_decimal(solved["price"])
 LP_PCT = sympy_to_decimal(solved["lp_pct"])
 LP_TOKENS = sympy_to_decimal(solved["lp_tokens"])
+CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
 
-print("math checks out", "price:", PRICE, "lp_pct:", LP_PCT, "lp_tokens:", LP_TOKENS)
+EPOCHS_PER_HALFLIFE = HALF_LIFE_YEARS * 12
+DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
+
+GENESIS_MS = int(os.environ["GENESIS_MS"])
+JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
 # ===========================================================================
 # §1b. CONFIGURATION — environment variables and constants
