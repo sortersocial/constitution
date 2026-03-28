@@ -52,6 +52,30 @@ TOTAL_SUPPLY = Decimal("1") # your slug balance is the fraction of the slug that
 LP_USDC = Decimal("1331") # Mathew 13:31
 FDV = Decimal("177600") # begins small
 
+# ---------------------------------------------------------------------------
+# §1a. OWNERSHIP MATH — two arbitrary choices, everything else derived
+# ---------------------------------------------------------------------------
+#
+# Constitutional choices:
+# - TOTAL_SUPPLY = 1.0 ownership unit
+# - FDV = 177,600 USDC
+# - LP_USDC = 1,331 USDC
+#
+# Unknowns solved from the system:
+# - price
+# - lp_tokens
+# - lp_pct
+#
+# Key identities:
+# - fdv     = price * supply
+# - lp_usdc = price * lp_tokens
+# - lp_pct  = lp_tokens / supply
+# - therefore lp_pct = lp_usdc / fdv
+
+def sympy_to_decimal(expr) -> Decimal:
+    num, den = expr.as_numer_denom()
+    return Decimal(str(num)) / Decimal(str(den))
+
 
 # inputs
 supply, lp_usdc, fdv = sp.symbols("supply lp_usdc fdv", positive=True)
@@ -59,59 +83,87 @@ supply, lp_usdc, fdv = sp.symbols("supply lp_usdc fdv", positive=True)
 # free
 price, lp_tokens, lp_pct = sp.symbols("price lp_tokens lp_pct", positive=True)
 
-# System of equations:
-#   fdv     = price * supply
-#   lp_usdc = price * lp_tokens
-#   lp_pct  = lp_tokens / supply
-#
-equations = [
+ownership_equations = [
     sp.Eq(fdv, price * supply),
     sp.Eq(lp_usdc, price * lp_tokens),
     sp.Eq(lp_pct, lp_tokens / supply),
 ]
-solution = sp.solve(equations, [price, lp_tokens, lp_pct], dict=True)[0]
+ownership_solution = sp.solve(ownership_equations, [price, lp_tokens, lp_pct], dict=True)[0]
 
 # Algebraic identities that must follow from the solved system.
-assert sp.simplify(solution[price] - (fdv / supply)) == 0, "price must equal fdv / supply"
-assert sp.simplify(solution[lp_pct] - (lp_usdc / fdv)) == 0, "lp_pct must equal lp_usdc / fdv"
-assert sp.simplify(solution[lp_tokens] - (solution[lp_pct] * supply)) == 0, "lp_tokens must equal lp_pct * supply"
+assert sp.simplify(ownership_solution[price] - (fdv / supply)) == 0, "price must equal fdv / supply"
+assert sp.simplify(ownership_solution[lp_pct] - (lp_usdc / fdv)) == 0, "lp_pct must equal lp_usdc / fdv"
+assert sp.simplify(ownership_solution[lp_tokens] - (ownership_solution[lp_pct] * supply)) == 0, "lp_tokens must equal lp_pct * supply"
 
 # Instantiate the constitutional choices exactly.
-instantiated = {
+ownership_subs = {
     supply: sp.Integer(1),
     fdv: sp.Integer(177600),
     lp_usdc: sp.Integer(1331),
 }
-solved = {
-    "price": sp.simplify(solution[price].subs(instantiated)),
-    "lp_pct": sp.simplify(solution[lp_pct].subs(instantiated)),
-    "lp_tokens": sp.simplify(solution[lp_tokens].subs(instantiated)),
-}
+price_exact = sp.simplify(ownership_solution[price].subs(ownership_subs))
+lp_pct_exact = sp.simplify(ownership_solution[lp_pct].subs(ownership_subs))
+lp_tokens_exact = sp.simplify(ownership_solution[lp_tokens].subs(ownership_subs))
 
 # Concrete startup checks: either the constitution proves itself or boot fails.
-assert solved["price"] == sp.Integer(177600), "constitutional price mismatch"
-assert solved["lp_pct"] == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
-assert solved["lp_tokens"] == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
+assert price_exact == sp.Integer(177600), "constitutional price mismatch"
+assert lp_pct_exact == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
+assert lp_tokens_exact == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
 
-
-def sympy_to_decimal(expr) -> Decimal:
-    num, den = expr.as_numer_denom()
-    return Decimal(str(num)) / Decimal(str(den))
-
-
-PRICE = sympy_to_decimal(solved["price"])
-LP_PCT = sympy_to_decimal(solved["lp_pct"])
-LP_TOKENS = sympy_to_decimal(solved["lp_tokens"])
+PRICE = sympy_to_decimal(price_exact)
+LP_PCT = sympy_to_decimal(lp_pct_exact)
+LP_TOKENS = sympy_to_decimal(lp_tokens_exact)
 CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
 
-EPOCHS_PER_HALFLIFE = HALF_LIFE_YEARS * 12
+# ---------------------------------------------------------------------------
+# §1b. HALF-LIFE MATH — exact monthly epochs, exact half-life condition
+# ---------------------------------------------------------------------------
+#
+# If each epoch is exactly 1/12 of a year, then:
+#   epochs_per_halflife = half_life_years * 12
+#
+# If the remaining pool fraction after one epoch is (1 - decay_rate), then
+# after k epochs it is:
+#   remaining_fraction(k) = (1 - decay_rate)^k
+#
+# To make the half-life exact we require:
+#   remaining_fraction(epochs_per_halflife) = 1/2
+#
+# Solving that gives:
+#   decay_rate = 1 - 2^(-1 / epochs_per_halflife)
+#
+# The runtime Decimal expression below is the same law written as:
+#   1 - exp(ln(0.5) / epochs_per_halflife)
+
+epochs_per_year = sp.Integer(12)
+half_life_years_exact = sp.Rational(str(HALF_LIFE_YEARS))
+epochs_per_halflife_exact = sp.simplify(half_life_years_exact * epochs_per_year)
+decay_rate_exact = 1 - sp.Rational(1, 2) ** (sp.Integer(1) / epochs_per_halflife_exact)
+remaining_fraction_at_half_life = sp.simplify((1 - decay_rate_exact) ** epochs_per_halflife_exact)
+
+assert remaining_fraction_at_half_life == sp.Rational(1, 2), "half-life law mismatch"
+
+EPOCHS_PER_HALFLIFE = sympy_to_decimal(epochs_per_halflife_exact)
+EPOCH_LENGTH_YEARS = Decimal("1") / Decimal("12")
+HALF_LIFE_REMAINING_FRACTION = Decimal("0.5")
 DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
+FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL * DECAY_RATE
+
+print(
+    "math checks out",
+    "price:", PRICE,
+    "lp_pct:", LP_PCT,
+    "lp_tokens:", LP_TOKENS,
+    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE,
+    "first_epoch_emission:", FIRST_EPOCH_EMISSION,
+    flush=True,
+)
 
 GENESIS_MS = int(os.environ["GENESIS_MS"])
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
 # ===========================================================================
-# §1b. CONFIGURATION — environment variables and constants
+# §1c. CONFIGURATION — environment variables and constants
 # ===========================================================================
 
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
@@ -130,7 +182,7 @@ SLUG_MODEL_RANK_PARENT = os.environ.get(
 
 
 # ===========================================================================
-# §1b. LEDGER SCHEMA — typed events
+# §1d. LEDGER SCHEMA — typed events
 # ===========================================================================
 
 @event
