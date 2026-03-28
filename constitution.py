@@ -11,6 +11,7 @@
 #   "itsdangerous",
 #   "starlette",
 #   "numpy",
+#   "sympy",
 # ]
 # ///
 """
@@ -29,6 +30,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
 import json, time, os, asyncio, httpx, pathlib
+import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from evaleval import (
     event, JsonlStore, to_dict, render, RawContent, Signer, SnippetExecutionError,
@@ -45,20 +47,62 @@ signer = Signer()
 # §1. CONSTANTS — the two free parameters and everything derived from them
 # ===========================================================================
 
-HALF_LIFE_YEARS = Decimal("17.72577371892")
+HALF_LIFE_YEARS = Decimal("17.72577371892") # promethium
+TOTAL_SUPPLY = Decimal("1") # your slug balance is the fraction of the slug that you own.
+LP_USDC = Decimal("1331") # Mathew 13:31
+FDV = Decimal("177600") # begins small
 
-TOTAL_SUPPLY = Decimal("177600")
-LP_TOKENS = Decimal("1776")
-CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
-EPOCHS_PER_HALFLIFE = HALF_LIFE_YEARS * 12
-DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
 
-GENESIS_MS = int(os.environ["GENESIS_MS"])
-JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
+def sympy_to_decimal(expr) -> Decimal:
+    num, den = expr.as_numer_denom()
+    return Decimal(str(num)) / Decimal(str(den))
 
-SOLANA_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
-MINT_ADDRESS = os.environ.get("MINT_ADDRESS", "")
-TREASURY_ADDRESS = os.environ.get("TREASURY_ADDRESS", "")
+supply, lp_usdc, fdv = sp.symbols("supply lp_usdc fdv", positive=True)
+
+# free
+price, lp_tokens, lp_pct = sp.symbols("price lp_tokens lp_pct", positive=True)
+
+# System of equations:
+#   fdv     = price * supply
+#   lp_usdc = price * lp_tokens
+#   lp_pct  = lp_tokens / supply
+#
+equations = [
+    sp.Eq(fdv, price * supply),
+    sp.Eq(lp_usdc, price * lp_tokens),
+    sp.Eq(lp_pct, lp_tokens / supply),
+]
+solution = sp.solve(equations, [price, lp_tokens, lp_pct], dict=True)[0]
+
+# Algebraic identities that must follow from the solved system.
+assert sp.simplify(solution[price] - (fdv / supply)) == 0, "price must equal fdv / supply"
+assert sp.simplify(solution[lp_pct] - (lp_usdc / fdv)) == 0, "lp_pct must equal lp_usdc / fdv"
+assert sp.simplify(solution[lp_tokens] - (lp_pct * supply)) == 0, "lp_tokens must equal lp_pct * supply"
+
+# Instantiate the constitutional choices exactly.
+instantiated = {
+    supply: sp.Integer(1),
+    fdv: sp.Integer(177600),
+    lp_usdc: sp.Integer(1331),
+}
+solved = {
+    "price": sp.simplify(solution[price].subs(instantiated)),
+    "lp_pct": sp.simplify(solution[lp_pct].subs(instantiated)),
+    "lp_tokens": sp.simplify(solution[lp_tokens].subs(instantiated)),
+}
+
+# Concrete startup checks: either the constitution proves itself or boot fails.
+assert solved["price"] == sp.Integer(177600), "constitutional price mismatch"
+assert solved["lp_pct"] == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
+assert solved["lp_tokens"] == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
+
+PRICE = sympy_to_decimal(solved["price"])
+LP_PCT = sympy_to_decimal(solved["lp_pct"])
+LP_TOKENS = sympy_to_decimal(solved["lp_tokens"])
+
+# ===========================================================================
+# §1b. CONFIGURATION — environment variables and constants
+# ===========================================================================
 
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
@@ -719,6 +763,12 @@ async def get_epoch():
     pool = pool_remaining(store.read())
     return {
         "epoch": epoch_n, "start_ms": start, "next_boundary_ms": next_b,
+        "total_supply": str(TOTAL_SUPPLY),
+        "fdv": str(FDV),
+        "price": str(PRICE),
+        "lp_usdc": str(LP_USDC),
+        "lp_pct": str(LP_PCT),
+        "lp_tokens": str(LP_TOKENS),
         "pool_remaining": str(pool), "pool_pct": str(pool / CONTRIBUTOR_POOL * 100),
         "total_emitted": str(CONTRIBUTOR_POOL - pool), "decay_rate_per_epoch": str(DECAY_RATE),
     }
@@ -852,7 +902,7 @@ async def index(request: Request):
     if not user:
         return _page("slug constitution", ["div",
             ["h1", "slug constitution"],
-            ["p", "177,600 tokens. $1 each. Promethium half-life. Laskar polynomial epochs."],
+            ["p", "Total supply is 1.0 SLUG ownership unit. FDV is 177,600 USDC. Initial LP seed is 1,331 USDC."],
             ["p", ["a", {"href": "/login"}, "Login with GitHub to check your emissions"]],
             ["p",
                 ["a", {"href": "/sse"}, "Watch emission process live"], " | ",
@@ -876,7 +926,7 @@ async def index(request: Request):
 
     return _page(f"slug — {user}", ["div",
         ["h1", f"Welcome, {user}"],
-        ["p", f"Total earned: {total_earned:.6f} SLUG"],
+        ["p", f"Total earned: {total_earned:.12f} SLUG ownership"],
         ["p", f"Latest rank score: {latest_rank or 'no emissions yet'}"],
         ["h2", "Redeem to Solana wallet"],
         redeem_form,
