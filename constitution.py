@@ -100,6 +100,8 @@ PRICE = sympy_to_decimal(solved["price"])
 LP_PCT = sympy_to_decimal(solved["lp_pct"])
 LP_TOKENS = sympy_to_decimal(solved["lp_tokens"])
 
+print("math checks out", "price:", PRICE, "lp_pct:", LP_PCT, "lp_tokens:", LP_TOKENS)
+
 # ===========================================================================
 # §1b. CONFIGURATION — environment variables and constants
 # ===========================================================================
