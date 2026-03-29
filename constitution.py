@@ -47,52 +47,49 @@ signer = Signer()
 # §1. CONSTANTS — the two free parameters and everything derived from them
 # ===========================================================================
 
-HALF_LIFE_YEARS = sp.Rational("17.72577371892") # promethium
-TOTAL_SUPPLY = sp.Integer(1) # your slug balance is the fraction of the slug that you own.
-LP_USDC = sp.Integer(1331) # Mathew 13:31
-FDV = sp.Integer(177600) # begins small
+half_life_years = sp.Rational("17.72577371892") # promethium
+total_supply = sp.Integer(1) # your slug balance is the fraction of the slug that you own.
+lp_usdc = sp.Integer(1331) # Mathew 13:31
+fdv = sp.Integer(177600) # begins small
 
 # ---------------------------------------------------------------------------
 # §1a. OWNERSHIP MATH — two arbitrary choices, everything else derived
 # ---------------------------------------------------------------------------
 
 # inputs
-supply, lp_usdc, fdv = sp.symbols("supply lp_usdc fdv", positive=True)
+supply_s, lp_usdc_s, fdv_s = sp.symbols("supply lp_usdc fdv", positive=True)
 
 # free
-price, lp_tokens, lp_pct = sp.symbols("price lp_tokens lp_pct", positive=True)
+price_s, lp_tokens_s, lp_pct_s = sp.symbols("price lp_tokens lp_pct", positive=True)
 
 ownership_equations = [
-    sp.Eq(fdv, price * supply),
-    sp.Eq(lp_usdc, price * lp_tokens),
-    sp.Eq(lp_pct, lp_tokens / supply),
+    sp.Eq(fdv_s, price_s * supply_s),
+    sp.Eq(lp_usdc_s, price_s * lp_tokens_s),
+    sp.Eq(lp_pct_s, lp_tokens_s / supply_s),
 ]
-ownership_solution = sp.solve(ownership_equations, [price, lp_tokens, lp_pct], dict=True)[0]
+ownership_solution = sp.solve(ownership_equations, [price_s, lp_tokens_s, lp_pct_s], dict=True)[0]
 
 # Solve-derived identities that must follow from the system.
-assert sp.simplify(ownership_solution[price] - (fdv / supply)) == 0, "price must equal fdv / supply"
-assert sp.simplify(ownership_solution[lp_pct] - (lp_usdc / fdv)) == 0, "lp_pct must equal lp_usdc / fdv"
-assert sp.simplify(ownership_solution[lp_tokens] - (ownership_solution[lp_pct] * supply)) == 0, "lp_tokens must equal lp_pct * supply"
+assert sp.simplify(ownership_solution[price_s] - (fdv_s / supply_s)) == 0, "price must equal fdv / supply"
+assert sp.simplify(ownership_solution[lp_pct_s] - (lp_usdc_s / fdv_s)) == 0, "lp_pct must equal lp_usdc / fdv"
+assert sp.simplify(ownership_solution[lp_tokens_s] - (ownership_solution[lp_pct_s] * supply_s)) == 0, "lp_tokens must equal lp_pct * supply"
 
 # Instantiate the constitutional choices exactly.
 ownership_subs = {
-    supply: TOTAL_SUPPLY,
-    fdv: FDV,
-    lp_usdc: LP_USDC,
+    supply_s: total_supply,
+    fdv_s: fdv,
+    lp_usdc_s: lp_usdc,
 }
-price_exact = sp.simplify(ownership_solution[price].subs(ownership_subs))
-lp_pct_exact = sp.simplify(ownership_solution[lp_pct].subs(ownership_subs))
-lp_tokens_exact = sp.simplify(ownership_solution[lp_tokens].subs(ownership_subs))
+price = sp.simplify(ownership_solution[price_s].subs(ownership_subs))
+lp_pct = sp.simplify(ownership_solution[lp_pct_s].subs(ownership_subs))
+lp_tokens = sp.simplify(ownership_solution[lp_tokens_s].subs(ownership_subs))
 
 # Concrete startup checks: either the constitution proves itself or boot fails.
-assert price_exact == FDV, "constitutional price mismatch"
-assert lp_pct_exact == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
-assert lp_tokens_exact == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
+assert price == fdv, "constitutional price mismatch"
+assert lp_pct == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
+assert lp_tokens == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
 
-PRICE = price_exact
-LP_PCT = lp_pct_exact
-LP_TOKENS = lp_tokens_exact
-CONTRIBUTOR_POOL = sp.simplify(TOTAL_SUPPLY - LP_TOKENS)
+contributor_pool = sp.simplify(total_supply - lp_tokens)
 
 # ---------------------------------------------------------------------------
 # §1b. EPOCH SCALE — exact symbolic constants before runtime
@@ -102,7 +99,7 @@ CONTRIBUTOR_POOL = sp.simplify(TOTAL_SUPPLY - LP_TOKENS)
 # Here we only derive the scalar that links the half-life constant to the
 # per-epoch decay law used during emissions.
 
-EPOCHS_PER_HALFLIFE = sp.simplify(HALF_LIFE_YEARS * sp.Integer(12))
+epochs_per_halflife = sp.simplify(half_life_years * sp.Integer(12))
 
 
 def sympy_to_decimal(expr) -> Decimal:
@@ -114,25 +111,25 @@ def sympy_to_decimal(expr) -> Decimal:
 # Runtime Decimal values begin here. We convert as late as possible because
 # the ledger and transfer math needs Decimal, but the constitution itself
 # should stay symbolic and exact.
-HALF_LIFE_YEARS_D = sympy_to_decimal(HALF_LIFE_YEARS)
-TOTAL_SUPPLY_D = sympy_to_decimal(TOTAL_SUPPLY)
-LP_USDC_D = sympy_to_decimal(LP_USDC)
-FDV_D = sympy_to_decimal(FDV)
-PRICE_D = sympy_to_decimal(PRICE)
-LP_PCT_D = sympy_to_decimal(LP_PCT)
-LP_TOKENS_D = sympy_to_decimal(LP_TOKENS)
-CONTRIBUTOR_POOL_D = sympy_to_decimal(CONTRIBUTOR_POOL)
-EPOCHS_PER_HALFLIFE_D = sympy_to_decimal(EPOCHS_PER_HALFLIFE)
-EPOCH_LENGTH_YEARS_D = Decimal("1") / Decimal("12")
-DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE_D).exp()
-FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL_D * DECAY_RATE
+HALF_LIFE_YEARS = sympy_to_decimal(half_life_years)
+TOTAL_SUPPLY = sympy_to_decimal(total_supply)
+LP_USDC = sympy_to_decimal(lp_usdc)
+FDV = sympy_to_decimal(fdv)
+PRICE = sympy_to_decimal(price)
+LP_PCT = sympy_to_decimal(lp_pct)
+LP_TOKENS = sympy_to_decimal(lp_tokens)
+CONTRIBUTOR_POOL = sympy_to_decimal(contributor_pool)
+EPOCHS_PER_HALFLIFE = sympy_to_decimal(epochs_per_halflife)
+EPOCH_LENGTH_YEARS = Decimal("1") / Decimal("12")
+DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
+FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL * DECAY_RATE
 
 print(
     "math checks out",
-    "price:", PRICE_D,
-    "lp_pct:", LP_PCT_D,
-    "lp_tokens:", LP_TOKENS_D,
-    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE_D,
+    "price:", PRICE,
+    "lp_pct:", LP_PCT,
+    "lp_tokens:", LP_TOKENS,
+    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE,
     "first_epoch_emission:", FIRST_EPOCH_EMISSION,
     flush=True,
 )
@@ -198,40 +195,46 @@ store = JsonlStore(JSONL_PATH)
 # §2. LASKAR POLYNOMIAL — the planet decides when epochs turn
 # ===========================================================================
 
-J2000_UNIX_MS = Decimal("946728000000")
-JULIAN_CENTURY_MS = Decimal("36525") * 86400 * 1000
-DAY_MS = Decimal("86400000")
+j2000_unix_ms = sp.Integer(946728000000)
+julian_century_ms = sp.Integer(36525 * 86400 * 1000)
+day_ms = sp.Integer(86400000)
 
-A0 = Decimal("365.2421896698")
-A1 = Decimal("-6.15359E-6")
-A2 = Decimal("-7.29E-10")
-A3 = Decimal("2.64E-10")
+a0 = sp.Rational("365.2421896698")
+a1 = sp.Rational("-6.15359e-6")
+a2 = sp.Rational("-7.29e-10")
+a3 = sp.Rational("2.64e-10")
+
+genesis_ms = sp.Integer(GENESIS_MS)
+
+
+def round_sympy_ms(x) -> int:
+    return int(sp.floor(sp.sympify(x) + sp.Rational(1, 2)))
 
 
 def T_from_unix_ms(ms):
-    return (Decimal(ms) - J2000_UNIX_MS) / JULIAN_CENTURY_MS
+    return (sp.sympify(ms) - j2000_unix_ms) / julian_century_ms
 
 
 def tropical_epoch_ms(unix_ms):
     T = T_from_unix_ms(unix_ms)
-    days = A0 + A1 * T + A2 * T**2 + A3 * T**3
-    return days * DAY_MS / 12
+    days = a0 + a1 * T + a2 * T**2 + a3 * T**3
+    return sp.simplify(days * day_ms / sp.Integer(12))
 
 
 def epoch_boundary(n):
-    boundary = Decimal(GENESIS_MS)
+    boundary = genesis_ms
     for e in range(n):
         boundary += tropical_epoch_ms(boundary)
-    return int(round(boundary))
+    return round_sympy_ms(boundary)
 
 
 def current_epoch():
     now = int(time.time() * 1000)
-    boundary = Decimal(GENESIS_MS)
+    boundary = genesis_ms
     for e in range(10000):
         next_boundary = boundary + tropical_epoch_ms(boundary)
-        if int(round(next_boundary)) > now:
-            return e, int(round(boundary)), int(round(next_boundary))
+        if round_sympy_ms(next_boundary) > now:
+            return e, round_sympy_ms(boundary), round_sympy_ms(next_boundary)
         boundary = next_boundary
     return -1, 0, 0
 
@@ -693,7 +696,7 @@ async def rank_commits(since_ms):
 
 def pool_remaining(events: list) -> Decimal:
     emitted = sum(Decimal(e.total_emitted) for e in events if isinstance(e, Emission))
-    return CONTRIBUTOR_POOL_D - emitted
+    return CONTRIBUTOR_POOL - emitted
 
 
 async def run_emission(epoch_n, boundary_ms):
@@ -803,14 +806,14 @@ async def get_epoch():
     pool = pool_remaining(store.read())
     return {
         "epoch": epoch_n, "start_ms": start, "next_boundary_ms": next_b,
-        "total_supply": str(TOTAL_SUPPLY_D),
-        "fdv": str(FDV_D),
-        "price": str(PRICE_D),
-        "lp_usdc": str(LP_USDC_D),
-        "lp_pct": str(LP_PCT_D),
-        "lp_tokens": str(LP_TOKENS_D),
-        "pool_remaining": str(pool), "pool_pct": str(pool / CONTRIBUTOR_POOL_D * 100),
-        "total_emitted": str(CONTRIBUTOR_POOL_D - pool), "decay_rate_per_epoch": str(DECAY_RATE),
+        "total_supply": str(TOTAL_SUPPLY),
+        "fdv": str(FDV),
+        "price": str(PRICE),
+        "lp_usdc": str(LP_USDC),
+        "lp_pct": str(LP_PCT),
+        "lp_tokens": str(LP_TOKENS),
+        "pool_remaining": str(pool), "pool_pct": str(pool / CONTRIBUTOR_POOL * 100),
+        "total_emitted": str(CONTRIBUTOR_POOL - pool), "decay_rate_per_epoch": str(DECAY_RATE),
     }
 
 
@@ -835,17 +838,17 @@ async def get_contributor(github_username: str):
 
 @app.get("/api/halvening")
 async def get_halvening():
-    boundary = Decimal(GENESIS_MS)
-    elapsed_years = Decimal("0")
+    boundary = genesis_ms
+    elapsed_years = sp.Integer(0)
+    epoch_years = sp.Rational(1, 12)
     for e in range(300):
         epoch_dur = tropical_epoch_ms(boundary)
-        epoch_years = EPOCH_LENGTH_YEARS_D
-        if elapsed_years + epoch_years >= HALF_LIFE_YEARS_D:
-            fraction = (HALF_LIFE_YEARS_D - elapsed_years) / epoch_years
-            jubilee_ms = int(boundary + fraction * epoch_dur)
+        if elapsed_years + epoch_years >= HALF_LIFE_YEARS:
+            fraction = (HALF_LIFE_YEARS - elapsed_years) / epoch_years
+            jubilee_ms = round_sympy_ms(boundary + fraction * epoch_dur)
             dt = datetime.fromtimestamp(jubilee_ms / 1000, tz=timezone.utc)
             return {"jubilee_ms": jubilee_ms, "jubilee_utc": dt.isoformat(),
-                    "epoch": e + float(fraction), "half_life_years": str(HALF_LIFE_YEARS_D)}
+                    "epoch": e + float(fraction), "half_life_years": str(HALF_LIFE_YEARS)}
         elapsed_years += epoch_years
         boundary += epoch_dur
 
