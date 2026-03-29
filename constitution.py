@@ -47,7 +47,6 @@ signer = Signer()
 # §1. CONSTANTS — the two free parameters and everything derived from them
 # ===========================================================================
 
-half_life_years = sp.Rational("17.72577371892") # promethium
 total_supply = sp.Integer(1) # your slug balance is the fraction of the slug that you own.
 lp_usdc = sp.Integer(1331) # Mathew 13:31
 fdv = sp.Integer(177600) # begins small
@@ -99,6 +98,7 @@ contributor_pool = sp.simplify(total_supply - lp_tokens)
 # Here we only derive the scalar that links the half-life constant to the
 # per-epoch decay law used during emissions.
 
+half_life_years = sp.Rational("17.72577371892") # promethium
 epochs_per_halflife = sp.simplify(half_life_years * sp.Integer(12))
 
 
