@@ -44,16 +44,29 @@ app.add_middleware(SessionMiddleware, secret_key=os.environ["SESSION_SECRET"])
 signer = Signer()
 
 # ===========================================================================
-# §1. CONSTANTS — the two free parameters and everything derived from them
+# §1. CONSTANTS — constitutional inputs and everything derived from them
 # ===========================================================================
 
-total_supply = sp.Integer(1) # your slug balance is the fraction of the slug that you own.
-lp_usdc = sp.Integer(1331) # Mathew 13:31
-fdv = sp.Integer(177600) # begins small
+# Four constitutional inputs. These are the arbitrary choices.
+total_supply = sp.Integer(1)          # your slug balance is the fraction of the slug that you own.
+lp_usdc = sp.Integer(1331)            # Mathew 13:31
+fdv = sp.Integer(177600)              # begins small
+HALF_LIFE_YEARS = Decimal("17.72577371892")  # promethium
+
+# The founder receives zero initial allocation. Tokens are earned only
+# through contributions, same as everyone else.
+FOUNDER_INITIAL_SHARE = Decimal("0")
 
 # ---------------------------------------------------------------------------
-# §1a. OWNERSHIP MATH — two arbitrary choices, everything else derived
+# §1a. OWNERSHIP MATH — solve the system, derive everything else
 # ---------------------------------------------------------------------------
+#
+# Solve this system for (price, lp_tokens, lp_pct):
+#   fdv     = price * supply
+#   lp_usdc = price * lp_tokens
+#   lp_pct  = lp_tokens / supply
+#
+# The key derived identity: lp_pct = lp_usdc / fdv
 
 # inputs
 supply_s, lp_usdc_s, fdv_s = sp.symbols("supply lp_usdc fdv", positive=True)
@@ -61,32 +74,28 @@ supply_s, lp_usdc_s, fdv_s = sp.symbols("supply lp_usdc fdv", positive=True)
 # free
 price_s, lp_tokens_s, lp_pct_s = sp.symbols("price lp_tokens lp_pct", positive=True)
 
-ownership_equations = [
+ownership_solution = sp.solve([
     sp.Eq(fdv_s, price_s * supply_s),
     sp.Eq(lp_usdc_s, price_s * lp_tokens_s),
     sp.Eq(lp_pct_s, lp_tokens_s / supply_s),
-]
-ownership_solution = sp.solve(ownership_equations, [price_s, lp_tokens_s, lp_pct_s], dict=True)[0]
+], [price_s, lp_tokens_s, lp_pct_s], dict=True)[0]
 
-# Solve-derived identities that must follow from the system.
 assert sp.simplify(ownership_solution[price_s] - (fdv_s / supply_s)) == 0, "price must equal fdv / supply"
 assert sp.simplify(ownership_solution[lp_pct_s] - (lp_usdc_s / fdv_s)) == 0, "lp_pct must equal lp_usdc / fdv"
 assert sp.simplify(ownership_solution[lp_tokens_s] - (ownership_solution[lp_pct_s] * supply_s)) == 0, "lp_tokens must equal lp_pct * supply"
 
-# Instantiate the constitutional choices exactly.
-ownership_subs = {
-    supply_s: total_supply,
-    fdv_s: fdv,
-    lp_usdc_s: lp_usdc,
-}
-price = sp.simplify(ownership_solution[price_s].subs(ownership_subs))
-lp_pct = sp.simplify(ownership_solution[lp_pct_s].subs(ownership_subs))
-lp_tokens = sp.simplify(ownership_solution[lp_tokens_s].subs(ownership_subs))
+subs = {supply_s: total_supply, fdv_s: fdv, lp_usdc_s: lp_usdc}
+price = sp.simplify(ownership_solution[price_s].subs(subs))
+lp_pct = sp.simplify(ownership_solution[lp_pct_s].subs(subs))
+lp_tokens = sp.simplify(ownership_solution[lp_tokens_s].subs(subs))
 
-# Concrete startup checks: either the constitution proves itself or boot fails.
 assert price == fdv, "constitutional price mismatch"
 assert lp_pct == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
 assert lp_tokens == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
+
+# ---------------------------------------------------------------------------
+# §1b. RUNTIME DECIMALS — convert once, use everywhere below
+# ---------------------------------------------------------------------------
 
 def sympy_to_decimal(expr) -> Decimal:
     num, den = expr.as_numer_denom()
@@ -98,12 +107,13 @@ FDV = sympy_to_decimal(fdv)
 PRICE = sympy_to_decimal(price)
 LP_PCT = sympy_to_decimal(lp_pct)
 LP_TOKENS = sympy_to_decimal(lp_tokens)
+CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
 
 GENESIS_MS = int(os.environ["GENESIS_MS"])
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
 # ===========================================================================
-# §1b. CONFIGURATION — environment variables and constants
+# §1c. CONFIGURATION — environment variables and constants
 # ===========================================================================
 
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
@@ -122,7 +132,7 @@ SLUG_MODEL_RANK_PARENT = os.environ.get(
 
 
 # ===========================================================================
-# §1c. LEDGER SCHEMA — typed events
+# §1d. LEDGER SCHEMA — typed events
 # ===========================================================================
 
 @event
@@ -656,37 +666,10 @@ async def rank_commits(since_ms):
 
 
 # ===========================================================================
-# §5. HALF-LIFE EMISSION LAW — decay policy derived from one constant
+# §5. EMISSION — the pool decays, contributors receive
 # ===========================================================================
-#
-# The calendar law is the Laskar recurrence above.
-# The emission law below is separate: one constitutional half-life constant
-# induces one per-epoch decay rate.
 
-CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
-
-half_life_years = sp.Rational("17.72577371892") # promethium
-epochs_per_halflife = sp.simplify(half_life_years * sp.Integer(12))
-
-HALF_LIFE_YEARS = sympy_to_decimal(half_life_years)
-EPOCHS_PER_HALFLIFE = sympy_to_decimal(epochs_per_halflife)
-DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
-FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL * DECAY_RATE
-
-print(
-    "math checks out",
-    "price:", PRICE,
-    "lp_pct:", LP_PCT,
-    "lp_tokens:", LP_TOKENS,
-    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE,
-    "first_epoch_emission:", FIRST_EPOCH_EMISSION,
-    flush=True,
-)
-
-
-# ===========================================================================
-# §6. EMISSION — the pool decays, contributors receive
-# ===========================================================================
+DECAY_RATE = 1 - (Decimal("0.5").ln() / (HALF_LIFE_YEARS * 12)).exp()
 
 def pool_remaining(events: list) -> Decimal:
     emitted = sum(Decimal(e.total_emitted) for e in events if isinstance(e, Emission))
@@ -735,7 +718,7 @@ async def run_emission(epoch_n, boundary_ms):
 
 
 # ===========================================================================
-# §7. FOUR FUNCTIONS — query holdings, rankings, treasury, distribute USDC
+# §6. FOUR FUNCTIONS — query holdings, rankings, treasury, distribute USDC
 # ===========================================================================
 
 async def query_token_holdings():
@@ -760,7 +743,7 @@ async def distribute_usdc(holdings, treasury_balance):
 
 
 # ===========================================================================
-# §8. EPOCH TIMER — sleep until the exact millisecond
+# §7. EPOCH TIMER — sleep until the exact millisecond
 # ===========================================================================
 
 async def epoch_loop():
@@ -786,7 +769,7 @@ async def epoch_loop():
 
 
 # ===========================================================================
-# §9. API — 2-line read forwards + computed endpoints
+# §8. API — 2-line read forwards + computed endpoints
 # ===========================================================================
 
 @app.get("/api/ledger")
@@ -832,18 +815,19 @@ async def get_contributor(github_username: str):
 
 @app.get("/api/halvening")
 async def get_halvening():
+    half_life = sp.Rational(str(HALF_LIFE_YEARS))
     boundary = genesis_ms
-    elapsed_years = sp.Integer(0)
+    elapsed = sp.Integer(0)
     epoch_years = sp.Rational(1, 12)
     for e in range(300):
         epoch_dur = tropical_epoch_ms(boundary)
-        if elapsed_years + epoch_years >= HALF_LIFE_YEARS:
-            fraction = (HALF_LIFE_YEARS - elapsed_years) / epoch_years
+        if elapsed + epoch_years >= half_life:
+            fraction = (half_life - elapsed) / epoch_years
             jubilee_ms = round_sympy_ms(boundary + fraction * epoch_dur)
             dt = datetime.fromtimestamp(jubilee_ms / 1000, tz=timezone.utc)
             return {"jubilee_ms": jubilee_ms, "jubilee_utc": dt.isoformat(),
                     "epoch": e + float(fraction), "half_life_years": str(HALF_LIFE_YEARS)}
-        elapsed_years += epoch_years
+        elapsed += epoch_years
         boundary += epoch_dur
 
 
@@ -861,7 +845,7 @@ async def test_emit():
 
 
 # ===========================================================================
-# §10. SSE — live audit stream of the pairwise voting process
+# §9. SSE — live audit stream of the pairwise voting process
 #
 # TODO: the /sse emission audit page needs a real SSE-driven UI. votes arrive
 # incrementally during rank_commits(), and the client should show a live
@@ -897,7 +881,7 @@ async def sse_stream(request: Request):
 
 
 # ===========================================================================
-# §11. UI — hiccup pages + signed snippet POST handler
+# §10. UI — hiccup pages + signed snippet POST handler
 # ===========================================================================
 
 _FORM_INTERCEPT_JS = """
@@ -989,7 +973,7 @@ async def do(request: Request):
 
 
 # ===========================================================================
-# §12. OAUTH — GitHub login
+# §11. OAUTH — GitHub login
 # ===========================================================================
 
 @app.get("/login")
@@ -1018,7 +1002,7 @@ async def callback(request: Request, code: str):
 
 
 # ===========================================================================
-# §13. STARTUP
+# §12. STARTUP
 # ===========================================================================
 
 @app.on_event("startup")
