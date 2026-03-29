@@ -88,57 +88,22 @@ assert price == fdv, "constitutional price mismatch"
 assert lp_pct == sp.Rational(1331, 177600), "constitutional LP percentage mismatch"
 assert lp_tokens == sp.Rational(1331, 177600), "constitutional LP token allocation mismatch"
 
-contributor_pool = sp.simplify(total_supply - lp_tokens)
-
-# ---------------------------------------------------------------------------
-# §1b. EPOCH SCALE — exact symbolic constants before runtime
-# ---------------------------------------------------------------------------
-#
-# The interesting calendar math lives later in the Laskar polynomial.
-# Here we only derive the scalar that links the half-life constant to the
-# per-epoch decay law used during emissions.
-
-half_life_years = sp.Rational("17.72577371892") # promethium
-epochs_per_halflife = sp.simplify(half_life_years * sp.Integer(12))
-
-
 def sympy_to_decimal(expr) -> Decimal:
     num, den = expr.as_numer_denom()
     return Decimal(str(num)) / Decimal(str(den))
 
-
-
-# Runtime Decimal values begin here. We convert as late as possible because
-# the ledger and transfer math needs Decimal, but the constitution itself
-# should stay symbolic and exact.
-HALF_LIFE_YEARS = sympy_to_decimal(half_life_years)
 TOTAL_SUPPLY = sympy_to_decimal(total_supply)
 LP_USDC = sympy_to_decimal(lp_usdc)
 FDV = sympy_to_decimal(fdv)
 PRICE = sympy_to_decimal(price)
 LP_PCT = sympy_to_decimal(lp_pct)
 LP_TOKENS = sympy_to_decimal(lp_tokens)
-CONTRIBUTOR_POOL = sympy_to_decimal(contributor_pool)
-EPOCHS_PER_HALFLIFE = sympy_to_decimal(epochs_per_halflife)
-EPOCH_LENGTH_YEARS = Decimal("1") / Decimal("12")
-DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
-FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL * DECAY_RATE
-
-print(
-    "math checks out",
-    "price:", PRICE,
-    "lp_pct:", LP_PCT,
-    "lp_tokens:", LP_TOKENS,
-    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE,
-    "first_epoch_emission:", FIRST_EPOCH_EMISSION,
-    flush=True,
-)
 
 GENESIS_MS = int(os.environ["GENESIS_MS"])
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
 # ===========================================================================
-# §1c. CONFIGURATION — environment variables and constants
+# §1b. CONFIGURATION — environment variables and constants
 # ===========================================================================
 
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
@@ -157,7 +122,7 @@ SLUG_MODEL_RANK_PARENT = os.environ.get(
 
 
 # ===========================================================================
-# §1d. LEDGER SCHEMA — typed events
+# §1c. LEDGER SCHEMA — typed events
 # ===========================================================================
 
 @event
@@ -223,7 +188,7 @@ def tropical_epoch_ms(unix_ms):
 
 def epoch_boundary(n):
     boundary = genesis_ms
-    for e in range(n):
+    for _ in range(n):
         boundary += tropical_epoch_ms(boundary)
     return round_sympy_ms(boundary)
 
@@ -691,7 +656,36 @@ async def rank_commits(since_ms):
 
 
 # ===========================================================================
-# §5. EMISSION — the pool decays, contributors receive
+# §5. HALF-LIFE EMISSION LAW — decay policy derived from one constant
+# ===========================================================================
+#
+# The calendar law is the Laskar recurrence above.
+# The emission law below is separate: one constitutional half-life constant
+# induces one per-epoch decay rate.
+
+CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
+
+half_life_years = sp.Rational("17.72577371892") # promethium
+epochs_per_halflife = sp.simplify(half_life_years * sp.Integer(12))
+
+HALF_LIFE_YEARS = sympy_to_decimal(half_life_years)
+EPOCHS_PER_HALFLIFE = sympy_to_decimal(epochs_per_halflife)
+DECAY_RATE = 1 - (Decimal("0.5").ln() / EPOCHS_PER_HALFLIFE).exp()
+FIRST_EPOCH_EMISSION = CONTRIBUTOR_POOL * DECAY_RATE
+
+print(
+    "math checks out",
+    "price:", PRICE,
+    "lp_pct:", LP_PCT,
+    "lp_tokens:", LP_TOKENS,
+    "epochs_per_halflife:", EPOCHS_PER_HALFLIFE,
+    "first_epoch_emission:", FIRST_EPOCH_EMISSION,
+    flush=True,
+)
+
+
+# ===========================================================================
+# §6. EMISSION — the pool decays, contributors receive
 # ===========================================================================
 
 def pool_remaining(events: list) -> Decimal:
@@ -741,7 +735,7 @@ async def run_emission(epoch_n, boundary_ms):
 
 
 # ===========================================================================
-# §6. FOUR FUNCTIONS — query holdings, rankings, treasury, distribute USDC
+# §7. FOUR FUNCTIONS — query holdings, rankings, treasury, distribute USDC
 # ===========================================================================
 
 async def query_token_holdings():
@@ -766,7 +760,7 @@ async def distribute_usdc(holdings, treasury_balance):
 
 
 # ===========================================================================
-# §7. EPOCH TIMER — sleep until the exact millisecond
+# §8. EPOCH TIMER — sleep until the exact millisecond
 # ===========================================================================
 
 async def epoch_loop():
@@ -792,7 +786,7 @@ async def epoch_loop():
 
 
 # ===========================================================================
-# §8. API — 2-line read forwards + computed endpoints
+# §9. API — 2-line read forwards + computed endpoints
 # ===========================================================================
 
 @app.get("/api/ledger")
@@ -867,7 +861,7 @@ async def test_emit():
 
 
 # ===========================================================================
-# §9. SSE — live audit stream of the pairwise voting process
+# §10. SSE — live audit stream of the pairwise voting process
 #
 # TODO: the /sse emission audit page needs a real SSE-driven UI. votes arrive
 # incrementally during rank_commits(), and the client should show a live
@@ -903,7 +897,7 @@ async def sse_stream(request: Request):
 
 
 # ===========================================================================
-# §10. UI — hiccup pages + signed snippet POST handler
+# §11. UI — hiccup pages + signed snippet POST handler
 # ===========================================================================
 
 _FORM_INTERCEPT_JS = """
@@ -995,7 +989,7 @@ async def do(request: Request):
 
 
 # ===========================================================================
-# §11. OAUTH — GitHub login
+# §12. OAUTH — GitHub login
 # ===========================================================================
 
 @app.get("/login")
@@ -1024,7 +1018,7 @@ async def callback(request: Request, code: str):
 
 
 # ===========================================================================
-# §12. STARTUP
+# §13. STARTUP
 # ===========================================================================
 
 @app.on_event("startup")
