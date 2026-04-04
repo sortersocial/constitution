@@ -22,7 +22,7 @@ from xrpl.models.amounts import IssuedCurrencyAmount
 from xrpl.models.requests import AccountInfo, AccountLines, GatewayBalances
 from xrpl.transaction import submit_and_wait
 
-GENESIS_MS = 1775364389892
+GENESIS_MS = 1775364391260
 
 CURRENCY = "SLG"
 TOTAL_SUPPLY = "1"

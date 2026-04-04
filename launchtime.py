@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 from skyfield import almanac
 from skyfield.api import N, E, wgs84, load
 
-gps_north = Decimal("41.90223")
-gps_east = Decimal("12.45908")
+gps_north = Decimal("41.902270")
+gps_east = Decimal("12.453365")
 
 ts = load.timescale()
 eph = load("de440s.bsp")
