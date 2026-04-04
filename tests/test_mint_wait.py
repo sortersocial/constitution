@@ -1,12 +1,12 @@
 """
-Tests for mint.wait_until_unix_ms and next_sleep_seconds.
+Tests for mint_wait: fmt_duration, next_sleep_seconds, wait_until_unix_ms.
 
 Uses a fake clock so we verify we reach target_ms without relying on wall time.
 """
 
 import pytest
 
-from mint_wait import next_sleep_seconds, wait_until_unix_ms
+from mint_wait import fmt_duration, next_sleep_seconds, wait_until_unix_ms
 
 
 class FakeClock:
@@ -91,3 +91,37 @@ def test_wait_until_sum_of_sleeps_equals_delta():
     target = 123 + 99_999
     wait_until_unix_ms(target, now_ms=clock.now_ms, sleep_fn=clock.sleep, log=lambda _: None)
     assert clock.now_ms() == target
+
+
+def test_wait_until_logs_human_readable_durations():
+    """Log messages use human-readable format like '1 minute, 40 seconds'."""
+    clock = FakeClock(start_ms=0)
+    target = 100_000
+    logs: list[str] = []
+    wait_until_unix_ms(target, now_ms=clock.now_ms, sleep_fn=clock.sleep, log=logs.append)
+    assert any("minute" in msg or "second" in msg for msg in logs)
+    assert not any("T-" in msg and msg.endswith("s") and "second" not in msg for msg in logs)
+
+
+# ---------------------------------------------------------------------------
+# fmt_duration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "ms, expected",
+    [
+        (0, "0 seconds"),
+        (999, "0 seconds"),
+        (1_000, "1 second"),
+        (2_000, "2 seconds"),
+        (60_000, "1 minute"),
+        (61_000, "1 minute, 1 second"),
+        (3_600_000, "1 hour"),
+        (3_661_000, "1 hour, 1 minute, 1 second"),
+        (86_400_000, "1 day"),
+        (90_061_000, "1 day, 1 hour, 1 minute, 1 second"),
+        (12_090_000, "3 hours, 21 minutes, 30 seconds"),
+    ],
+)
+def test_fmt_duration(ms, expected):
+    assert fmt_duration(ms) == expected

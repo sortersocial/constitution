@@ -8,6 +8,28 @@ import time
 from collections.abc import Callable
 
 
+def fmt_duration(ms: int) -> str:
+    """Format milliseconds as a human-readable duration like '3 hours, 21 minutes, 30 seconds'."""
+    total_secs = ms // 1000
+    if total_secs <= 0:
+        return "0 seconds"
+
+    days, rem = divmod(total_secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if secs or not parts:
+        parts.append(f"{secs} second{'s' if secs != 1 else ''}")
+    return ", ".join(parts)
+
+
 def next_sleep_seconds(remaining_ms: int) -> float | None:
     """
     How long to sleep before re-checking the clock, or None if the target
@@ -47,8 +69,6 @@ def wait_until_unix_ms(
         secs = next_sleep_seconds(remaining)
         if secs is None:
             return
-        if remaining > 60_000:
-            _log(f"    T-{remaining / 1000:.0f}s")
-        elif remaining > 5_000:
-            _log(f"    T-{remaining / 1000:.1f}s")
+        if remaining > 5_000:
+            _log(f"    T-{fmt_duration(remaining)}")
         _sleep(secs)
