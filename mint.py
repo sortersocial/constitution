@@ -26,6 +26,7 @@ GENESIS_MS = 1775364389892
 
 CURRENCY = "SLG"
 TOTAL_SUPPLY = "1"
+DOMAIN = "slug.social"
 
 TESTNET_URL = "https://s.altnet.rippletest.net:51234"
 MAINNET_URL = "https://xrplcluster.com"
@@ -72,12 +73,13 @@ def load_wallets(network: str) -> tuple[Wallet, Wallet]:
 # ---------------------------------------------------------------------------
 
 def configure_cold_wallet(client: JsonRpcClient, cold: Wallet):
-    """Enable DefaultRipple so SLG can flow between holders."""
+    """Enable DefaultRipple and set domain so SLG issuer is verifiable."""
     tx = AccountSet(
         account=cold.classic_address,
         set_flag=AccountSetAsfFlag.ASF_DEFAULT_RIPPLE,
+        domain=DOMAIN.encode("ascii").hex(),
     )
-    print(f"  Configuring cold wallet (DefaultRipple)...")
+    print(f"  Configuring cold wallet (DefaultRipple, domain={DOMAIN})...")
     result = submit_and_wait(tx, client, cold)
     status = result.result["meta"]["TransactionResult"]
     print(f"    {status}")
@@ -153,9 +155,13 @@ def verify(client: JsonRpcClient, cold: Wallet, hot: Wallet):
         ledger_index="validated",
         hotwallet=[hot.classic_address],
     ))
+    for addr, balances in gw_resp.result.get("balances", {}).items():
+        for b in balances:
+            if b.get("currency") == CURRENCY:
+                print(f"    Issuer view: {b['value']} {CURRENCY} held by {addr}")
     obligations = gw_resp.result.get("obligations", {})
     if CURRENCY in obligations:
-        print(f"    Cold wallet obligations: {obligations[CURRENCY]} {CURRENCY}")
+        print(f"    Total obligations: {obligations[CURRENCY]} {CURRENCY}")
 
     for label, addr in [("Cold", cold.classic_address), ("Hot", hot.classic_address)]:
         info = client.request(AccountInfo(account=addr))
