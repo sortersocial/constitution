@@ -22,6 +22,8 @@ from xrpl.models.amounts import IssuedCurrencyAmount
 from xrpl.models.requests import AccountInfo, AccountLines, GatewayBalances
 from xrpl.transaction import submit_and_wait
 
+from mint_wait import wait_until_unix_ms
+
 GENESIS_MS = 1775364391260
 
 CURRENCY = "SLG"
@@ -272,19 +274,7 @@ def run_mint():
 
     if wait_ms > 0:
         print(f"  Waiting {wait_ms / 1000:.1f}s until genesis...\n")
-        while True:
-            now_ms = int(time.time() * 1000)
-            remaining = GENESIS_MS - now_ms
-            if remaining <= 0:
-                break
-            if remaining > 60_000:
-                print(f"    T-{remaining / 1000:.0f}s")
-                time.sleep(min(remaining / 1000 - 30, 60))
-            elif remaining > 5_000:
-                print(f"    T-{remaining / 1000:.1f}s")
-                time.sleep(1)
-            else:
-                time.sleep(remaining / 1000)
+        wait_until_unix_ms(GENESIS_MS)
 
     launch_ts = datetime.now(timezone.utc)
     print(f"\n  GENESIS -- {launch_ts.isoformat()}")
