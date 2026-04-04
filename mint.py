@@ -317,13 +317,40 @@ def run_mint():
     print(f"  1 {CURRENCY} is live on XRPL mainnet.")
 
 
+def run_balance():
+    path = wallets_path("mainnet")
+    if not path.exists():
+        print("No mainnet wallets found. Run 'setup' first.")
+        sys.exit(1)
+
+    data = json.loads(path.read_text())
+    client = JsonRpcClient(MAINNET_URL)
+
+    print(f"  Cold (issuer):      {data['cold']['classic_address']}")
+    print(f"  Hot (operational):  {data['hot']['classic_address']}")
+    print()
+
+    for label, key in [("Cold", "cold"), ("Hot", "hot")]:
+        addr = data[key]["classic_address"]
+        try:
+            info = client.request(AccountInfo(account=addr))
+            balance_drops = int(info.result["account_data"]["Balance"])
+            balance_xrp = balance_drops / 1_000_000
+            print(f"  {label}: {balance_xrp} XRP  ({balance_drops} drops)")
+        except Exception as e:
+            print(f"  {label}: not activated yet ({e})")
+
+
+MODES = {"testnet": run_testnet, "setup": run_setup, "mint": run_mint, "balance": run_balance}
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in ("testnet", "setup", "mint"):
-        print("Usage: python mint.py [testnet|setup|mint]")
+    if len(sys.argv) < 2 or sys.argv[1] not in MODES:
+        print("Usage: python mint.py [testnet|setup|mint|balance]")
         print()
         print("  testnet  — full dry run on XRPL testnet (free, uses faucet)")
         print("  setup    — generate mainnet wallets, print addresses for funding")
         print("  mint     — wait for genesis sunrise, then issue 1 SLG on mainnet")
+        print("  balance  — check mainnet wallet balances")
         sys.exit(1)
 
-    {"testnet": run_testnet, "setup": run_setup, "mint": run_mint}[sys.argv[1]]()
+    MODES[sys.argv[1]]()
