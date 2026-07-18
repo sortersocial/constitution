@@ -24,12 +24,12 @@ A daily GitHub Action backs up the JSONL ledger to the same repo.
 Run: uv run constitution.py
 """
 
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, DefaultContext
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
-import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl
+import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl, base64
 import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from evaleval import (
@@ -37,6 +37,7 @@ from evaleval import (
     exec_event, One, Two, Three, Selector, MORPH, PREPEND,
 )
 
+DefaultContext.prec = 50
 getcontext().prec = 50
 
 app = FastAPI()
@@ -130,13 +131,46 @@ OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.
 # discovery event.
 DEFAULT_REPOSITORIES = [
     {
+        "id": "constitution",
+        "url": "https://github.com/sortersocial/constitution.git",
+        "refs": ["refs/heads/**"],
+    },
+    {
         "id": "slug",
-        "url": "https://github.com/tommy-mor/slug.git",
+        "url": "https://github.com/sortersocial/slug.git",
+        "refs": ["refs/heads/**"],
+    },
+    {
+        "id": "sorter",
+        "url": "https://github.com/sorterisntonline/sorter.git",
+        "refs": ["refs/heads/**"],
+    },
+    {
+        "id": "sorter2",
+        "url": "https://github.com/sortersocial/sorter2.git",
+        "refs": ["refs/heads/**"],
+    },
+    {
+        "id": "sorter-oldest",
+        "url": "https://github.com/tommy-mor/sorter.git",
         "refs": ["refs/heads/**"],
     },
 ]
 DEFAULT_CONTRIBUTORS = {
     "tommy-mor": ["thmorriss@gmail.com"],
+    "christopher-whitman": [
+        "chris@cwwhitman.com",
+        "7566903+cwwhitman@users.noreply.github.com",
+    ],
+    "jake-chvatal": [
+        "jake+github@uln.industries",
+        "jakechvatal@gmail.com",
+        "jake@isnt.online",
+    ],
+    "lara": ["me@lara.lv"],
+    "nat-reid": ["nathanielreid@gmail.com"],
+    "zod": ["jason.p.mcel@gmail.com", "me@zod.tf"],
+    "jovan": ["jovan@slug.social", "jovan@getcivicai.com"],
 }
 
 REPOSITORIES = json.loads(
@@ -147,6 +181,7 @@ CONTRIBUTORS = json.loads(
 )
 GIT_MIRROR_DIR = pathlib.Path(os.environ.get("GIT_MIRROR_DIR", "/data/git"))
 GIT_TIMEOUT_SECONDS = int(os.environ.get("GIT_TIMEOUT_SECONDS", "120"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # Council model IDs: slug.social garden rank under this parent (bodies = OpenRouter URLs), then top-up from OpenRouter list.
 SLUG_SOCIAL_BASE_URL = os.environ.get("SLUG_SOCIAL_BASE_URL", "https://slug.social").rstrip("/")
@@ -661,20 +696,30 @@ def _git(repo: pathlib.Path | None, *args: str, input_bytes: bytes | None = None
     if repo is not None:
         command += ["-C", str(repo)]
     command += list(args)
+    git_env = {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+    }
+    if GITHUB_TOKEN:
+        credential = base64.b64encode(
+            f"x-access-token:{GITHUB_TOKEN}".encode()
+        ).decode()
+        git_env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraHeader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Basic {credential}",
+        })
     try:
         result = subprocess.run(
             command,
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={
-                **os.environ,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_NO_REPLACE_OBJECTS": "1",
-                "LC_ALL": "C",
-                "TZ": "UTC",
-            },
+            env=git_env,
             timeout=GIT_TIMEOUT_SECONDS,
             check=False,
         )
@@ -844,9 +889,15 @@ def _build_discovery(epoch_n: int, boundary_ms: int, events: list) -> GitDiscove
         canonical_location = min(
             locations[qualified_oid], key=lambda x: (x[0], x[1])
         )
+        # One commit may be reachable from dozens of refs in the same mirror.
+        # Verify its object once per repository, not once per source ref.
+        object_locations = {
+            (str(m), raw_oid): (m, raw_oid)
+            for _, _, m, raw_oid in locations[qualified_oid]
+        }
         object_hashes = {
             hashlib.sha256(_git(m, "cat-file", "commit", raw_oid)).hexdigest()
-            for _, _, m, raw_oid in locations[qualified_oid]
+            for m, raw_oid in object_locations.values()
         }
         if len(object_hashes) != 1:
             raise RuntimeError(f"conflicting Git objects share OID {qualified_oid}")
@@ -994,11 +1045,55 @@ async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
 
 
 SSE_CLIENTS = []
+AUDIT_HISTORY = []
+AUDIT_SEQUENCE = 0
+PROCESS_STATE = {
+    "running": False,
+    "phase": "idle",
+    "progress": 100,
+    "message": "Waiting for the next epoch",
+}
+
+
+def _sse_event(event_name: str, payload: dict) -> str:
+    return (
+        f"event: {event_name}\n"
+        f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
+    )
+
+
+async def broadcast_audit(
+    kind: str,
+    message: str,
+    *,
+    progress: int | None = None,
+    phase: str | None = None,
+) -> dict:
+    global AUDIT_SEQUENCE
+    AUDIT_SEQUENCE += 1
+    if progress is not None:
+        PROCESS_STATE["progress"] = max(0, min(100, int(progress)))
+    if phase is not None:
+        PROCESS_STATE["phase"] = phase
+    PROCESS_STATE["message"] = message
+    payload = {
+        "id": AUDIT_SEQUENCE,
+        "timestamp_ms": int(time.time() * 1000),
+        "kind": kind,
+        "message": message,
+        **PROCESS_STATE,
+    }
+    AUDIT_HISTORY.append(payload)
+    del AUDIT_HISTORY[:-200]
+    wire = _sse_event("audit", payload)
+    for queue in list(SSE_CLIENTS):
+        await queue.put(wire)
+    return payload
 
 
 async def broadcast_js(js: str):
     """Send a JS snippet to all connected SSE clients."""
-    for queue in SSE_CLIENTS:
+    for queue in list(SSE_CLIENTS):
         await queue.put(js)
 
 
@@ -1006,10 +1101,29 @@ async def rank_commits(commits: list[dict]):
     if not commits:
         return {}, []
 
-    models = await fetch_top_models(n=3)
     contributors = sorted(set(c["contributor"] for c in commits))
-    if len(contributors) > 1 and not models:
+    if len(contributors) == 1:
+        await broadcast_audit(
+            "ranking",
+            f"Only {contributors[0]} is eligible; rank is 1.0",
+            progress=90,
+            phase="finalizing",
+        )
+        return {contributors[0]: Decimal("1")}, []
+    if not (OPENROUTER_API_KEY or "").strip():
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is required when multiple contributors need ranking"
+        )
+
+    models = await fetch_top_models(n=3)
+    if not models:
         raise RuntimeError("no council models available for contributor ranking")
+    await broadcast_audit(
+        "council",
+        f"Council selected: {', '.join(models)}",
+        progress=35,
+        phase="ranking",
+    )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-council", f"Council: {', '.join(models)} — {len(commits)} commits"]
     ]))
@@ -1035,6 +1149,11 @@ async def rank_commits(commits: list[dict]):
 
     async def compare_fn(i, j):
         a1, a2 = authors[i], authors[j]
+        await broadcast_audit(
+            "comparison",
+            f"Comparing {a1} with {a2}",
+            phase="ranking",
+        )
         await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
             ["div#emission-status", f"Comparing {a1} vs {a2}…"]
         ]))
@@ -1050,6 +1169,11 @@ async def rank_commits(commits: list[dict]):
                 if winner_weight <= 0 or loser_weight <= 0:
                     raise ValueError("ratio weights must be positive")
                 results.append((w, l, winner_weight, loser_weight))
+                await broadcast_audit(
+                    "vote",
+                    f"{model}: {authors[w]} over {authors[l]} ({result['ratio']})",
+                    phase="ranking",
+                )
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-vote",
                         ["span.model", model], " — ",
@@ -1059,6 +1183,11 @@ async def rank_commits(commits: list[dict]):
                     ]
                 ]))
             except Exception as e:
+                await broadcast_audit(
+                    "error",
+                    f"{model} failed: {e}",
+                    phase="error",
+                )
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-error", f"⚠ {model}: {e}"]
                 ]))
@@ -1068,8 +1197,13 @@ async def rank_commits(commits: list[dict]):
     async def progress_fn(ev):
         if ev["phase"] == "spanning_tree":
             label = f"Spanning tree: {ev['step']}/{ev['total']}"
+            percent = 35 + round(35 * ev["step"] / max(ev["total"], 1))
         else:
             label = f"Zip pass {ev['pass']}: {ev['step']}/{ev['total']}"
+            percent = 70 + round(20 * ev["step"] / max(ev["total"], 1))
+        await broadcast_audit(
+            "progress", label, progress=percent, phase="ranking"
+        )
         await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
             ["div#emission-status", label]
         ]))
@@ -1083,6 +1217,12 @@ async def rank_commits(commits: list[dict]):
     scores = rank_centrality(pairs)
     ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
     ranking_rows = sorted(ranking.items(), key=lambda x: x[1], reverse=True)
+    await broadcast_audit(
+        "ranking",
+        "Ranking: " + ", ".join(f"{a} {s:.4f}" for a, s in ranking_rows),
+        progress=90,
+        phase="finalizing",
+    )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-ranking",
             ["b", "Ranking: "],
@@ -1104,11 +1244,33 @@ def pool_remaining(events: list) -> Decimal:
 
 
 async def run_emission(epoch_n, boundary_ms):
+    PROCESS_STATE["running"] = True
+    await broadcast_audit(
+        "start",
+        f"Epoch {epoch_n} emission started",
+        progress=2,
+        phase="starting",
+    )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-start", f"⚡ Epoch {epoch_n} emission started"]
     ]))
 
+    await broadcast_audit(
+        "discovery",
+        "Fetching configured repositories and snapshotting refs",
+        progress=8,
+        phase="discovery",
+    )
     discovery = await discover_repositories(epoch_n, boundary_ms)
+    await broadcast_audit(
+        "discovery",
+        (
+            f"Discovered {len(discovery.observations)} new commits; "
+            f"{len(discovery.commits)} are eligible"
+        ),
+        progress=30,
+        phase="discovery",
+    )
     ranking, models = await rank_commits(discovery.commits)
 
     def make_emission(events):
@@ -1146,6 +1308,13 @@ async def run_emission(epoch_n, boundary_ms):
 
     entry = await store.atomic(make_emission)
     if entry:
+        PROCESS_STATE["running"] = False
+        await broadcast_audit(
+            "complete",
+            f"Epoch {entry.epoch} complete; emitted {entry.total_emitted} SLG",
+            progress=100,
+            phase="idle",
+        )
         await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
             ["div.log-amount",
                 f"Pool {entry.pool_before} → emit {entry.total_emitted} → {entry.pool_after}"]
@@ -1189,13 +1358,24 @@ async def distribute_usdc(holdings, treasury_balance):
 async def epoch_loop():
     while True:
         epoch_n, current_start, next_boundary = current_epoch()
+        processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
+        if epoch_n >= 0 and epoch_n not in processed:
+            try:
+                await run_emission(epoch_n, current_start)
+            except Exception as exc:
+                PROCESS_STATE["running"] = False
+                await broadcast_audit(
+                    "error",
+                    f"Epoch {epoch_n} failed: {exc}; retrying in 60 seconds",
+                    phase="error",
+                )
+                print(f"epoch {epoch_n} emission failed: {exc}", flush=True)
+                await asyncio.sleep(60)
+                continue
+
         now = int(time.time() * 1000)
         wait_ms = next_boundary - now
-
         if wait_ms <= 0:
-            processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
-            if epoch_n not in processed and epoch_n >= 0:
-                await run_emission(epoch_n, current_start)
             await asyncio.sleep(60)
         elif wait_ms < 86_400_000:
             await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
@@ -1241,6 +1421,36 @@ async def get_ranking():
         return {"ranking": {}, "epoch": -1}
     latest = emissions[-1]
     return {"ranking": latest.ranking, "epoch": latest.epoch}
+
+
+@app.get("/api/status")
+async def get_status():
+    events = store.read()
+    discoveries = [e for e in events if isinstance(e, GitDiscovery)]
+    emissions = [e for e in events if isinstance(e, Emission)]
+    return {
+        **PROCESS_STATE,
+        "epoch": current_epoch()[0],
+        "openrouter_configured": bool((OPENROUTER_API_KEY or "").strip()),
+        "sse_clients": len(SSE_CLIENTS),
+        "latest_discovery": (
+            {
+                "epoch": discoveries[-1].epoch,
+                "snapshot_id": discoveries[-1].snapshot_id,
+                "observations": len(discoveries[-1].observations),
+                "eligible_commits": len(discoveries[-1].commits),
+            }
+            if discoveries else None
+        ),
+        "latest_emission": (
+            {
+                "epoch": emissions[-1].epoch,
+                "total_emitted": emissions[-1].total_emitted,
+                "ranking": emissions[-1].ranking,
+            }
+            if emissions else None
+        ),
+    }
 
 
 @app.get("/api/contributor/{github_username}")
@@ -1306,13 +1516,6 @@ async def test_emit():
 
 # ===========================================================================
 # §9. SSE — live audit stream of the pairwise voting process
-#
-# TODO: the /sse emission audit page needs a real SSE-driven UI. votes arrive
-# incrementally during rank_commits(), and the client should show a live
-# progress bar and per-vote results as they stream in. this requires a
-# dedicated page that connects to /sse and updates the DOM on each event
-# (council, comparing, vote, ranking, emission_complete). defer until we
-# have playwright tests to cover it — the incremental rendering is fiddly.
 # ===========================================================================
 
 @app.get("/sse")
@@ -1322,6 +1525,13 @@ async def sse_stream(request: Request):
 
     async def generate():
         try:
+            yield _sse_event("audit", {
+                "id": AUDIT_SEQUENCE,
+                "timestamp_ms": int(time.time() * 1000),
+                "kind": "connection",
+                "message": f"Connected to epoch {current_epoch()[0]}",
+                **PROCESS_STATE,
+            })
             yield exec_event(Three[Selector("#emission-status")][MORPH][
                 ["div#emission-status", f"Connected — epoch {current_epoch()[0]}"]
             ])
@@ -1334,10 +1544,15 @@ async def sse_stream(request: Request):
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         finally:
-            SSE_CLIENTS.remove(queue)
+            if queue in SSE_CLIENTS:
+                SSE_CLIENTS.remove(queue)
 
     from starlette.responses import StreamingResponse
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ===========================================================================
@@ -1359,11 +1574,393 @@ def _page(title: str, body: list) -> HTMLResponse:
             ["meta", {"charset": "utf-8"}],
             ["meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}],
             ["title", title],
+            ["style", RawContent(_WATCH_CSS)],
         ],
         ["body",
             body,
             ["script", RawContent(_FORM_INTERCEPT_JS)],
         ],
+    ]))
+
+
+_WATCH_CSS = """
+/* ================================================================
+   ZIGGURAT — bevel-first dark theme
+   --spread (0→1) controls bevel depth. 0 = flat. 1 = full relief.
+   Light source: top-left. Shadow: bottom-right.
+   Platforms nest. Each level is raised. Nothing is rounded.
+   ================================================================ */
+
+:root {
+  color-scheme: dark;
+  --spread: 1;
+
+  --g0: #080808;
+  --g1: #131313;
+  --g2: #1c1c1c;
+  --g3: #252525;
+  --g4: #2e2e2e;
+  --g5: #383838;
+
+  --hi: #5e5e5e;
+  --lo: #050505;
+  --bv: calc(var(--spread) * 4px + 1px);
+  --bv-lg: calc(var(--spread) * 6px + 2px);
+
+  --signal: #f0f0f0;
+  --prose: #c2c2c2;
+  --ui: #888;
+  --meta: #4a4a4a;
+  --link: #8899ee;
+  --code-fg: #c8dda0;
+
+  --font-prose: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --font-ui: system-ui, -apple-system, sans-serif;
+  --font-code: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+body {
+  background: var(--g0);
+  color: var(--prose);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 0 auto;
+  max-width: 560px;
+  min-height: 100vh;
+  padding: 0 16px 48px;
+}
+main { width: 100%; padding: 18px 0 48px; }
+
+h1, h2, h3 {
+  color: var(--signal);
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 0.12em;
+  margin: 14px 0 6px;
+  text-transform: uppercase;
+}
+a { color: var(--link); text-decoration: none; }
+a:hover { color: var(--signal); }
+.eyebrow {
+  background: var(--g2);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  color: var(--ui);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  padding: 4px 10px;
+  text-transform: uppercase;
+  width: fit-content;
+}
+
+/* Every dashboard section is a raised platform. */
+.panel {
+  background: var(--g2);
+  border: var(--bv-lg) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  margin: 8px 0;
+  padding: 10px;
+  width: 100%;
+}
+.status-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+#process-status { color: var(--signal); font-family: var(--font-code); font-weight: bold; }
+.badge {
+  align-items: center;
+  background: var(--g3);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  color: var(--ui);
+  display: inline-flex;
+  font-size: 11px;
+  gap: 7px;
+  padding: 3px 8px;
+}
+.dot { background: var(--meta); height: 8px; width: 8px; }
+.live .dot { background: #7acc7a; }
+.warn .dot { background: #cc9955; }
+
+/* The progress track is inset; its signal is raised inside it. */
+.progress-shell {
+  background: var(--g1);
+  border: var(--bv-lg) solid;
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  height: 58px;
+  margin: 14px 0 10px;
+  overflow: hidden;
+  position: relative;
+}
+#progress-fill {
+  background: var(--link);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  height: 100%;
+  transition: width .35s steps(8, end);
+  width: 0;
+}
+#progress-label {
+  color: var(--signal);
+  display: grid;
+  font-family: var(--font-code);
+  font-size: 18px;
+  font-weight: bold;
+  inset: 0;
+  place-items: center;
+  position: absolute;
+  text-shadow: 1px 1px var(--lo);
+}
+
+.controls { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; }
+button {
+  background: var(--g5);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  color: var(--signal);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+}
+button:hover { background: #404040; }
+button:active {
+  background: var(--g4);
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  transform: translate(1px, 1px);
+}
+button:disabled { cursor: default; opacity: .4; }
+.note { color: var(--meta); font-size: 11px; margin: 4px 0; }
+
+.feed-head { align-items: baseline; display: flex; justify-content: space-between; }
+#audit-feed {
+  background: var(--g1);
+  border: var(--bv) solid;
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+  padding: 6px;
+}
+.event {
+  background: var(--g3);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  display: grid;
+  gap: 6px;
+  grid-template-columns: 82px 88px 1fr;
+  padding: 5px 8px;
+}
+.event[data-kind="error"] { border-left-color: #cc5555; }
+.event[data-kind="complete"], .event[data-kind="ranking"] { border-left-color: #7acc7a; }
+.event[data-kind="vote"] { border-left-color: var(--link); }
+.event time, .event-kind { color: var(--meta); font-family: var(--font-code); font-size: 10px; }
+.event-kind { text-transform: uppercase; }
+.event-message { color: var(--prose); font-family: var(--font-prose); }
+
+code {
+  background: var(--g1);
+  border: 2px solid;
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  color: var(--code-fg);
+  font-family: var(--font-code);
+  font-size: 12px;
+  padding: 1px 4px;
+}
+
+@media (max-width: 520px) {
+  .event { grid-template-columns: 72px 1fr; }
+  .event-message { grid-column: 1 / -1; }
+}
+"""
+
+
+def _watch_initial_state() -> dict:
+    events = store.read()
+    feed = []
+    for event_ in events[-40:]:
+        if isinstance(event_, GitDiscovery):
+            feed.append({
+                "id": f"discovery-{event_.snapshot_id}",
+                "timestamp_ms": event_.timestamp_ms,
+                "kind": "discovery",
+                "message": (
+                    f"Epoch {event_.epoch}: observed {len(event_.observations)} commits; "
+                    f"{len(event_.commits)} eligible"
+                ),
+            })
+        elif isinstance(event_, Emission):
+            feed.append({
+                "id": f"emission-{event_.epoch}",
+                "timestamp_ms": event_.timestamp_ms,
+                "kind": "complete",
+                "message": (
+                    f"Epoch {event_.epoch}: emitted {event_.total_emitted} SLG; "
+                    f"ranking {event_.ranking}"
+                ),
+            })
+    feed.extend(AUDIT_HISTORY)
+    return {
+        "process": dict(PROCESS_STATE),
+        "openrouter_configured": bool((OPENROUTER_API_KEY or "").strip()),
+        "epoch": current_epoch()[0],
+        "feed": feed[-200:],
+    }
+
+
+_WATCH_JS = """
+const initial = __INITIAL__;
+const feed = document.querySelector('#audit-feed');
+const processStatus = document.querySelector('#process-status');
+const connection = document.querySelector('#connection-status');
+const fill = document.querySelector('#progress-fill');
+const progressLabel = document.querySelector('#progress-label');
+const play = document.querySelector('#play');
+const pause = document.querySelector('#pause');
+const seen = new Set();
+let source = null;
+
+function setProgress(value) {
+  const n = Math.max(0, Math.min(100, Number(value ?? 0)));
+  fill.style.width = `${n}%`;
+  progressLabel.textContent = `${Math.round(n)}%`;
+  document.querySelector('.progress-shell').setAttribute('aria-valuenow', String(n));
+}
+
+function addEvent(event) {
+  const id = String(event.id);
+  if (seen.has(id)) return;
+  seen.add(id);
+  const row = document.createElement('div');
+  row.className = 'event';
+  row.dataset.kind = event.kind || 'event';
+  const when = document.createElement('time');
+  when.dateTime = new Date(event.timestamp_ms).toISOString();
+  when.textContent = new Date(event.timestamp_ms).toLocaleTimeString();
+  const kind = document.createElement('span');
+  kind.className = 'event-kind';
+  kind.textContent = event.kind || 'event';
+  const message = document.createElement('span');
+  message.className = 'event-message';
+  message.textContent = event.message;
+  row.append(when, kind, message);
+  feed.prepend(row);
+  while (feed.children.length > 200) feed.lastElementChild.remove();
+}
+
+function applyState(event) {
+  processStatus.textContent = event.message || 'Waiting for the next epoch';
+  setProgress(event.progress);
+  if (event.kind !== 'connection') addEvent(event);
+}
+
+function connect() {
+  if (source) return;
+  source = new EventSource('/sse');
+  connection.classList.remove('warn');
+  connection.classList.add('live');
+  connection.querySelector('span:last-child').textContent = 'connecting';
+  play.disabled = true;
+  pause.disabled = false;
+  source.onopen = () => {
+    connection.querySelector('span:last-child').textContent = 'live';
+  };
+  source.addEventListener('audit', event => applyState(JSON.parse(event.data)));
+  source.onerror = () => {
+    connection.classList.remove('live');
+    connection.classList.add('warn');
+    connection.querySelector('span:last-child').textContent = 'reconnecting';
+  };
+}
+
+function disconnect() {
+  if (source) source.close();
+  source = null;
+  connection.classList.remove('live');
+  connection.classList.add('warn');
+  connection.querySelector('span:last-child').textContent = 'paused locally';
+  play.disabled = false;
+  pause.disabled = true;
+}
+
+play.addEventListener('click', connect);
+pause.addEventListener('click', disconnect);
+initial.feed.forEach(addEvent);
+processStatus.textContent = initial.process.message;
+setProgress(initial.process.progress);
+connect();
+"""
+
+
+@app.get("/watch")
+async def watch():
+    initial = json.dumps(
+        _watch_initial_state(), separators=(",", ":")
+    ).replace("</", "<\\/")
+    script = _WATCH_JS.replace("__INITIAL__", initial)
+    key_ok = bool((OPENROUTER_API_KEY or "").strip())
+    return HTMLResponse(render(["html",
+        ["head",
+            ["meta", {"charset": "utf-8"}],
+            ["meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+            ["title", "slug — live constitution"],
+            ["style", RawContent(_WATCH_CSS)],
+        ],
+        ["body", ["main",
+            ["div.eyebrow", f"epoch {current_epoch()[0]} · constitutional audit"],
+            ["h1", "watch the process"],
+            ["section.panel",
+                ["div.status-row",
+                    ["div#process-status", PROCESS_STATE["message"]],
+                    ["div#connection-status.badge", ["span.dot"], ["span", "connecting"]],
+                ],
+                ["div.progress-shell", {
+                    "role": "progressbar", "aria-label": "Emission progress",
+                    "aria-valuemin": "0", "aria-valuemax": "100",
+                    "aria-valuenow": str(PROCESS_STATE["progress"]),
+                },
+                    ["div#progress-fill"],
+                    ["div#progress-label", f"{PROCESS_STATE['progress']}%"],
+                ],
+                ["div.controls",
+                    ["button#play", {"type": "button", "disabled": "true"}, "▶ Play live feed"],
+                    ["button#pause", {"type": "button"}, "Ⅱ Pause feed"],
+                    ["span.note", "Pause stops local updates; the constitutional process continues."],
+                ],
+            ],
+            ["section.panel",
+                ["div.status-row",
+                    ["strong", "Council readiness"],
+                    ["div.badge" + (".live" if key_ok else ".warn"),
+                        ["span.dot"],
+                        ["span", "OpenRouter configured" if key_ok else "OpenRouter key missing"],
+                    ],
+                ],
+                ["p.note",
+                    (
+                        "Pairwise council voting is ready."
+                        if key_ok else
+                        "Single-contributor epochs can finalize, but contested rankings require OPENROUTER_API_KEY."
+                    )
+                ],
+            ],
+            ["section.panel",
+                ["div.feed-head", ["h2", "event feed"], ["a", {"href": "/sse"}, "raw SSE"]],
+                ["div#audit-feed"],
+            ],
+            ["p", ["a", {"href": "/"}, "← constitution"], " · ",
+                  ["a", {"href": "/api/status"}, "status JSON"], " · ",
+                  ["a", {"href": "/api/ledger"}, "ledger"]],
+        ]],
+        ["script", {"type": "module"}, RawContent(script)],
     ]))
 
 
@@ -1386,7 +1983,7 @@ async def index(request: Request):
             ["p", "Total supply is 1.0 SLUG ownership unit. FDV is 177,600 USDC. Initial LP seed is 1,331 USDC."],
             ["p", ["a", {"href": "/login"}, "Login with GitHub to check your emissions"]],
             ["p",
-                ["a", {"href": "/sse"}, "Watch emission process live"], " | ",
+                ["a", {"href": "/watch"}, "Watch emission process live"], " | ",
                 ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
                 ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
                 ["a", {"href": "/api/halvening"}, "Jubilee countdown"],
@@ -1414,7 +2011,7 @@ async def index(request: Request):
         ["p",
             ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
             ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
-            ["a", {"href": "/sse"}, "Watch emission live"],
+            ["a", {"href": "/watch"}, "Watch emission live"],
         ],
     ])
 

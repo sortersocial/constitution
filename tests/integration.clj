@@ -468,14 +468,29 @@
         (assert! (= 1 (count (:history contrib-resp)))   "alice has 1 emission in history")
         (assert! (pos? (parse-double (:total_earned contrib-resp))) "total_earned > 0")
 
-        ;; 9. SSE connects and sends initial event
+        ;; 9. watch UI exposes progress, controls, readiness, and live SSE
+        (println "\nchecking /watch UI…")
+        (bind watch-html (slurp (str base-url "/watch")))
+        (assert! (str/includes? watch-html "role=\"progressbar\"")
+                 "watch page has progress bar")
+        (assert! (str/includes? watch-html "id=\"play\"")
+                 "watch page has play control")
+        (assert! (str/includes? watch-html "id=\"pause\"")
+                 "watch page has pause control")
+        (assert! (str/includes? watch-html "OpenRouter configured")
+                 "watch page reports council readiness")
+        (bind status-resp (get-json base-url "/api/status"))
+        (assert! (true? (:openrouter_configured status-resp))
+                 "status API reports OpenRouter configuration")
+
+        ;; 10. SSE connects and sends initial event
         (println "\nchecking /sse initial event…")
         (bind sse-events (read-sse-events (str base-url "/sse") 1 5000))
         (assert! (= 1 (count sse-events))             "received 1 SSE event")
         (assert! (not (str/blank? (first sse-events)))
                  "initial SSE event contains executable audit data")
 
-        ;; 10. POST /test/emit — full ranking pipeline hits mocks
+        ;; 11. POST /test/emit — full ranking pipeline hits mocks
         (println "\ntriggering /test/emit (epoch 1)…")
         (bind emit-resp (post-json! base-url "/test/emit"))
         (assert! (= "emission" (:type emit-resp))     "emit response type is emission")
@@ -503,7 +518,7 @@
         (bind rank-after (get-json base-url "/api/ranking"))
         (assert! (= 1 (:epoch rank-after))           "latest ranking is epoch 1")
 
-        ;; 11. kill and restart — prove replay determinism
+        ;; 12. kill and restart — prove replay determinism
         (println "\nkilling server for replay test…")
         (.destroyForcibly (:proc server))
         (deref server)

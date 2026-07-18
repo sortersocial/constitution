@@ -1,0 +1,7 @@
+.git
+.venv
+.hypothesis
+__pycache__
+tests
+*.json
+*.bsp

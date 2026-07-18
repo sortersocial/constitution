@@ -393,7 +393,9 @@ def test_empty_epoch_records_zero_emission_without_burning_pool(
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
 
     async def discover(_epoch, _boundary):
-        return SimpleNamespace(commits=[], snapshot_id="empty-snapshot")
+        return SimpleNamespace(
+            observations=[], commits=[], snapshot_id="empty-snapshot"
+        )
 
     async def rank(_commits):
         return {}, []
@@ -412,7 +414,11 @@ def test_emission_distribution_sums_exactly_to_total(
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
 
     async def discover(_epoch, _boundary):
-        return SimpleNamespace(commits=[{"x": 1}], snapshot_id="ranked-snapshot")
+        return SimpleNamespace(
+            observations=[{"x": 1}],
+            commits=[{"x": 1}],
+            snapshot_id="ranked-snapshot",
+        )
 
     async def rank(_commits):
         return {
@@ -454,6 +460,7 @@ def test_any_council_failure_aborts_ranking(monkeypatch):
 
     monkeypatch.setattr(c, "fetch_top_models", models)
     monkeypatch.setattr(c, "llm_pairwise_compare", compare)
+    monkeypatch.setattr(c, "OPENROUTER_API_KEY", "test-key")
     commits = [
         {
             "contributor": contributor,
@@ -465,3 +472,54 @@ def test_any_council_failure_aborts_ranking(monkeypatch):
     ]
     with pytest.raises(RuntimeError, match="council model failed"):
         asyncio.run(c.rank_commits(commits))
+
+
+def test_contested_ranking_requires_openrouter_key(monkeypatch):
+    monkeypatch.setattr(c, "OPENROUTER_API_KEY", "")
+    commits = [
+        {
+            "contributor": contributor,
+            "oid": "sha1:" + char * 40,
+            "message": contributor,
+            "patch": "patch",
+        }
+        for contributor, char in [("alice", "a"), ("bob", "b")]
+    ]
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        asyncio.run(c.rank_commits(commits))
+
+
+def test_watch_page_has_live_controls_progress_and_key_warning(
+    discovery_config, monkeypatch
+):
+    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+    monkeypatch.setattr(c, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(c, "current_epoch", lambda: (3, 0, 1))
+    response = asyncio.run(c.watch())
+    html = response.body.decode()
+    assert 'role="progressbar"' in html
+    assert 'id="play"' in html
+    assert 'id="pause"' in html
+    assert "new EventSource('/sse')" in html
+    assert "OpenRouter key missing" in html
+
+
+def test_audit_events_are_json_sse_and_update_process_state(monkeypatch):
+    clients = []
+    history = []
+    monkeypatch.setattr(c, "SSE_CLIENTS", clients)
+    monkeypatch.setattr(c, "AUDIT_HISTORY", history)
+    queue = asyncio.Queue()
+    clients.append(queue)
+
+    async def emit():
+        event = await c.broadcast_audit(
+            "progress", "halfway", progress=50, phase="ranking"
+        )
+        return event, await queue.get()
+
+    event, wire = asyncio.run(emit())
+    assert event["progress"] == 50
+    assert event["phase"] == "ranking"
+    assert wire.startswith("event: audit\ndata: {")
+    assert '"message":"halfway"' in wire
