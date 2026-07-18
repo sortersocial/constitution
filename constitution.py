@@ -6,7 +6,7 @@
 #   "uvicorn",
 #   "httpx",
 #   "tenacity",
-#   "evaleval>=0.2.6",
+#   "evaleval==0.2.7",
 #   "authlib",
 #   "itsdangerous",
 #   "starlette",
@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
-import json, time, os, asyncio, httpx, pathlib
+import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl
 import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from evaleval import (
@@ -118,11 +118,35 @@ JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
 
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
-REPO = os.environ.get("REPO", "tommy-mor/slug")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai").rstrip("/")
-GITHUB_API_BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com").rstrip("/")
+
+# Repositories, branches, and contributor identities are constitutional inputs.
+# A ref pattern matches a complete Git ref: * stays within one path component,
+# while ** crosses slashes, so refs/heads/** includes branches on branches.
+# Environment overrides exist for deterministic integration tests and deployments
+# using the exact same source; their normalized values are committed to every
+# discovery event.
+DEFAULT_REPOSITORIES = [
+    {
+        "id": "slug",
+        "url": "https://github.com/tommy-mor/slug.git",
+        "refs": ["refs/heads/**"],
+    },
+]
+DEFAULT_CONTRIBUTORS = {
+    "tommy-mor": ["thmorriss@gmail.com"],
+}
+
+REPOSITORIES = json.loads(
+    os.environ.get("REPOSITORIES_JSON", json.dumps(DEFAULT_REPOSITORIES))
+)
+CONTRIBUTORS = json.loads(
+    os.environ.get("CONTRIBUTORS_JSON", json.dumps(DEFAULT_CONTRIBUTORS))
+)
+GIT_MIRROR_DIR = pathlib.Path(os.environ.get("GIT_MIRROR_DIR", "/data/git"))
+GIT_TIMEOUT_SECONDS = int(os.environ.get("GIT_TIMEOUT_SECONDS", "120"))
 
 # Council model IDs: slug.social garden rank under this parent (bodies = OpenRouter URLs), then top-up from OpenRouter list.
 SLUG_SOCIAL_BASE_URL = os.environ.get("SLUG_SOCIAL_BASE_URL", "https://slug.social").rstrip("/")
@@ -146,6 +170,7 @@ class Emission:
     distributions: dict   # author -> amount str
     ranking: dict         # author -> score str
     models_used: list
+    discovery_snapshot_id: str = ""  # empty only for pre-discovery ledger history
 
 
 @event
@@ -161,6 +186,20 @@ class Redemption:
     github_user: str
     wallet_address: str
     amount: str
+
+
+@event
+class GitDiscovery:
+    schema_version: int
+    epoch: int
+    snapshot_id: str
+    timestamp_ms: int
+    config_digest: str
+    initial_snapshot: bool
+    configuration: dict
+    repositories: list
+    observations: list
+    commits: list
 
 
 store = JsonlStore(JSONL_PATH)
@@ -532,44 +571,426 @@ Side B — unified diffs (full patches):
         return json.loads(content)
 
 
-def _github_headers():
-    h = {"Accept": "application/vnd.github+json"}
-    tok = os.environ.get("GITHUB_TOKEN", "")
-    if tok:
-        h["Authorization"] = f"Bearer {tok}"
-    return h
+# ===========================================================================
+# §4b. GIT DISCOVERY — immutable reachability snapshots across repositories
+# ===========================================================================
+#
+# Git timestamps cannot prove when a branch first reached a commit. The first
+# snapshot therefore bootstraps history by committer time at GENESIS_MS. Every
+# later snapshot uses the stronger rule: a commit enters exactly once, when it
+# first becomes reachable from the union of configured refs.
+#
+# OIDs are deduplicated globally, then equivalent cherry-picks are deduplicated
+# by Git's stable patch identity. Merges and empty commits are graph structure,
+# not separately priced contributions. Discovery is all-or-nothing: if any
+# repository cannot be mirrored and verified, no snapshot is appended.
+
+GIT_DISCOVERY_SCHEMA_VERSION = 1
+PATCH_IDENTITY_VERSION = "git-patch-id-stable-v1"
+_DISCOVERY_LOCK = asyncio.Lock()
 
 
-def unified_diff_from_commit_payload(payload: dict) -> str:
-    parts = []
-    for f in payload.get("files") or []:
-        name = f.get("filename", "?")
-        patch = f.get("patch")
-        if patch:
-            parts.append(f"--- {name}\n{patch}")
+def _normalized_discovery_config() -> dict:
+    repositories = []
+    seen_ids = set()
+    for raw in REPOSITORIES:
+        repo_id = str(raw.get("id", ""))
+        url = str(raw.get("url", ""))
+        refs = sorted(set(str(x) for x in raw.get("refs", [])))
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", repo_id):
+            raise ValueError(f"invalid repository id: {repo_id!r}")
+        if repo_id in seen_ids:
+            raise ValueError(f"duplicate repository id: {repo_id}")
+        if not url or not refs or any(not r.startswith("refs/") for r in refs):
+            raise ValueError(f"repository {repo_id} requires a URL and full ref patterns")
+        seen_ids.add(repo_id)
+        repositories.append({"id": repo_id, "url": url, "refs": refs})
+
+    email_to_contributor = {}
+    contributors = {}
+    for contributor, emails in sorted(CONTRIBUTORS.items()):
+        contributor = str(contributor)
+        normalized = sorted(set(str(e).strip().lower() for e in emails))
+        if not contributor or not normalized:
+            raise ValueError("contributors require an id and at least one email")
+        for email in normalized:
+            if email in email_to_contributor:
+                raise ValueError(f"email belongs to multiple contributors: {email}")
+            email_to_contributor[email] = contributor
+        contributors[contributor] = normalized
+
+    repositories.sort(key=lambda r: r["id"])
+    return {"repositories": repositories, "contributors": contributors}
+
+
+def _config_digest(config: dict) -> str:
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _ref_pattern_regex(pattern: str) -> re.Pattern:
+    out = ""
+    i = 0
+    while i < len(pattern):
+        if pattern[i:i + 2] == "**":
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        elif pattern[i] == "?":
+            out += "[^/]"
+            i += 1
         else:
-            parts.append(f"--- {name}\n[no textual patch: binary, submodule, or too large]\n")
-    return "\n\n".join(parts) if parts else "[no files in API response]"
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile(f"^{out}$")
 
 
-async def fetch_commits_since(since_ms):
-    since_iso = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc).isoformat()
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits",
-            params={"since": since_iso, "per_page": 100},
-            headers=_github_headers(),
+def _git(repo: pathlib.Path | None, *args: str, input_bytes: bytes | None = None) -> bytes:
+    command = [
+        "git",
+        "--no-replace-objects",
+        "-c", "core.quotepath=true",
+        "-c", "core.attributesFile=/dev/null",
+        "-c", "diff.external=",
+        "-c", "diff.renames=false",
+        "-c", "diff.algorithm=myers",
+        "-c", "diff.context=3",
+    ]
+    if repo is not None:
+        command += ["-C", str(repo)]
+    command += list(args)
+    try:
+        result = subprocess.run(
+            command,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+            },
+            timeout=GIT_TIMEOUT_SECONDS,
+            check=False,
         )
-        return resp.json()
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git command timed out: {args[0]}") from exc
+    if result.returncode:
+        error = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"git {args[0]} failed: {error}")
+    return result.stdout
 
 
-async def fetch_commit_unified_diff(client: httpx.AsyncClient, sha: str) -> str:
-    resp = await client.get(
-        f"{GITHUB_API_BASE_URL}/repos/{REPO}/commits/{sha}",
-        headers=_github_headers(),
+def _ensure_mirror(repo: dict) -> pathlib.Path:
+    GIT_MIRROR_DIR.mkdir(parents=True, exist_ok=True)
+    mirror = GIT_MIRROR_DIR / f"{repo['id']}.git"
+    if not mirror.exists():
+        _git(None, "clone", "--mirror", "--", repo["url"], str(mirror))
+    else:
+        actual_url = _git(mirror, "remote", "get-url", "origin").decode().strip()
+        if actual_url != repo["url"]:
+            raise RuntimeError(
+                f"mirror URL mismatch for {repo['id']}: {actual_url!r}"
+            )
+    _git(mirror, "fetch", "--prune", "origin", "+refs/*:refs/*")
+    _git(mirror, "fsck", "--connectivity-only", "--no-dangling")
+    return mirror
+
+
+def _matching_refs(mirror: pathlib.Path, patterns: list[str]) -> list[dict]:
+    regexes = [_ref_pattern_regex(p) for p in patterns]
+    lines = _git(
+        mirror, "for-each-ref", "--format=%(refname)%00%(objectname)"
+    ).decode("utf-8", "replace").splitlines()
+    selected = []
+    for line in lines:
+        if not line:
+            continue
+        ref_name, direct_oid = line.split("\x00", 1)
+        if not any(r.fullmatch(ref_name) for r in regexes):
+            continue
+        commit_oid = _git(
+            mirror, "rev-parse", "--verify", f"{ref_name}^{{commit}}"
+        ).decode().strip()
+        selected.append({
+            "name": ref_name,
+            "direct_oid": direct_oid,
+            "commit_oid": commit_oid,
+        })
+    if not selected:
+        raise RuntimeError(f"no refs matched patterns {patterns!r}")
+    return sorted(selected, key=lambda r: r["name"])
+
+
+def _commit_metadata(mirror: pathlib.Path, oid: str) -> dict:
+    raw = _git(
+        mirror,
+        "show",
+        "-s",
+        "--format=%H%x00%T%x00%P%x00%an%x00%ae%x00%at%x00%cn%x00%ce%x00%ct%x00%B",
+        oid,
+    ).decode("utf-8", "replace")
+    fields = raw.split("\x00", 9)
+    if len(fields) != 10:
+        raise RuntimeError(f"could not parse commit metadata for {oid}")
+    return {
+        "oid": fields[0],
+        "tree_oid": fields[1],
+        "parent_oids": fields[2].split() if fields[2] else [],
+        "author_name": fields[3],
+        "author_email": fields[4].strip().lower(),
+        "author_timestamp_ms": int(fields[5]) * 1000,
+        "committer_name": fields[6],
+        "committer_email": fields[7].strip().lower(),
+        "committer_timestamp_ms": int(fields[8]) * 1000,
+        "message": fields[9].rstrip("\n"),
+    }
+
+
+def _commit_patch(mirror: pathlib.Path, metadata: dict) -> tuple[str, str | None]:
+    parents = metadata["parent_oids"]
+    if len(parents) > 1:
+        return "", None
+    if parents:
+        args = ("diff", "--patch", "--binary", "--full-index", "--no-renames",
+                "--no-ext-diff", "--no-textconv", "--src-prefix=a/",
+                "--dst-prefix=b/", parents[0], metadata["oid"], "--")
+    else:
+        args = ("diff-tree", "--root", "--patch", "--binary", "--full-index",
+                "--no-renames", "--no-ext-diff", "--no-textconv",
+                "--src-prefix=a/", "--dst-prefix=b/", "--no-commit-id",
+                metadata["oid"], "--")
+    patch_bytes = _git(mirror, *args)
+    if not patch_bytes.strip():
+        return "", None
+    # Run patch-id outside the repository so SHA-1 and SHA-256 repositories use
+    # the same canonical patch hash algorithm.
+    patch_id_out = _git(
+        None, "patch-id", "--stable", input_bytes=patch_bytes
+    ).decode().strip()
+    if patch_id_out:
+        stable_id = patch_id_out.split()[0]
+    else:
+        stable_id = hashlib.sha256(patch_bytes).hexdigest()
+    return patch_bytes.decode("utf-8", "replace"), f"{PATCH_IDENTITY_VERSION}:{stable_id}"
+
+
+def _replayed_discovery_state(events: list) -> tuple[set[str], dict[str, str]]:
+    seen_oids = set()
+    seen_patches = {}
+    for event_ in events:
+        if not isinstance(event_, GitDiscovery):
+            continue
+        for observation in event_.observations:
+            seen_oids.add(observation["oid"])
+            patch_identity = observation.get("patch_identity")
+            canonical_oid = observation.get("canonical_patch_oid")
+            if patch_identity and canonical_oid:
+                seen_patches.setdefault(patch_identity, canonical_oid)
+    return seen_oids, seen_patches
+
+
+def _build_discovery(epoch_n: int, boundary_ms: int, events: list) -> GitDiscovery:
+    config = _normalized_discovery_config()
+    digest = _config_digest(config)
+    prior_discoveries = [e for e in events if isinstance(e, GitDiscovery)]
+    initial = not prior_discoveries
+    seen_oids, seen_patches = _replayed_discovery_state(events)
+    email_to_contributor = {
+        email: contributor
+        for contributor, emails in config["contributors"].items()
+        for email in emails
+    }
+
+    repository_rows = []
+    locations: dict[str, list[tuple[str, str, pathlib.Path, str]]] = {}
+    for repo in config["repositories"]:
+        mirror = _ensure_mirror(repo)
+        object_format = _git(
+            mirror, "rev-parse", "--show-object-format"
+        ).decode().strip()
+        refs = _matching_refs(mirror, repo["refs"])
+        repo_reachable = set()
+        for ref in refs:
+            oids = _git(mirror, "rev-list", ref["commit_oid"]).decode().splitlines()
+            for oid in oids:
+                qualified = f"{object_format}:{oid}"
+                repo_reachable.add(qualified)
+                locations.setdefault(qualified, []).append(
+                    (repo["id"], ref["name"], mirror, oid)
+                )
+        repository_rows.append({
+            "id": repo["id"],
+            "url": repo["url"],
+            "object_format": object_format,
+            "refs": refs,
+            "reachable_commit_count": len(repo_reachable),
+            "reachable_set_sha256": hashlib.sha256(
+                "\n".join(sorted(repo_reachable)).encode()
+            ).hexdigest(),
+        })
+
+    new_oids = sorted(set(locations) - seen_oids)
+    pending = []
+    for qualified_oid in new_oids:
+        source_rows = sorted({
+            (repo_id, ref_name) for repo_id, ref_name, _, _ in locations[qualified_oid]
+        })
+        canonical_location = min(
+            locations[qualified_oid], key=lambda x: (x[0], x[1])
+        )
+        object_hashes = {
+            hashlib.sha256(_git(m, "cat-file", "commit", raw_oid)).hexdigest()
+            for _, _, m, raw_oid in locations[qualified_oid]
+        }
+        if len(object_hashes) != 1:
+            raise RuntimeError(f"conflicting Git objects share OID {qualified_oid}")
+        _, _, mirror, oid = canonical_location
+        metadata = _commit_metadata(mirror, oid)
+        patch, patch_identity = _commit_patch(mirror, metadata)
+        pending.append({
+            **metadata,
+            "oid": qualified_oid,
+            "commit_object_sha256": next(iter(object_hashes)),
+            "tree_oid": f"{qualified_oid.split(':', 1)[0]}:{metadata['tree_oid']}",
+            "parent_oids": [
+                f"{qualified_oid.split(':', 1)[0]}:{p}"
+                for p in metadata["parent_oids"]
+            ],
+            "patch": patch,
+            "patch_sha256": hashlib.sha256(patch.encode()).hexdigest() if patch else None,
+            "patch_identity_version": PATCH_IDENTITY_VERSION,
+            "patch_identity": patch_identity,
+            "first_sources": [
+                {"repository_id": repo_id, "ref_name": ref_name}
+                for repo_id, ref_name in source_rows
+            ],
+            "contributor": email_to_contributor.get(metadata["author_email"]),
+        })
+
+    # Select patch representatives independently of repository/ref iteration order.
+    # Every observed patch consumes its identity, even when it predates genesis or
+    # has no registered contributor: copying already-observed work later must not
+    # turn it into a newly payable contribution.
+    pending.sort(key=lambda c: (c["committer_timestamp_ms"], c["oid"]))
+    observations = []
+    commits = []
+    for commit in pending:
+        reason = None
+        canonical_patch_oid = None
+        patch_identity = commit["patch_identity"]
+        duplicate_patch = False
+        if patch_identity:
+            if patch_identity in seen_patches:
+                canonical_patch_oid = seen_patches[patch_identity]
+                duplicate_patch = True
+            else:
+                canonical_patch_oid = commit["oid"]
+                seen_patches[patch_identity] = canonical_patch_oid
+
+        if initial and commit["committer_timestamp_ms"] < GENESIS_MS:
+            reason = "before_genesis"
+        elif len(commit["parent_oids"]) > 1:
+            reason = "merge_commit"
+        elif not patch_identity:
+            reason = "empty_commit"
+        elif duplicate_patch:
+            reason = "duplicate_patch"
+        else:
+            if commit["contributor"] is None:
+                reason = "unknown_contributor"
+
+        eligible = reason is None
+        observation = {
+            "oid": commit["oid"],
+            "first_sources": commit["first_sources"],
+            "committer_timestamp_ms": commit["committer_timestamp_ms"],
+            "patch_identity": patch_identity,
+            "canonical_patch_oid": canonical_patch_oid,
+            "eligible": eligible,
+            "exclusion_reason": reason,
+        }
+        observations.append(observation)
+        if eligible:
+            commits.append(commit)
+
+    snapshot_material = {
+        "schema_version": GIT_DISCOVERY_SCHEMA_VERSION,
+        "epoch": epoch_n,
+        "timestamp_ms": boundary_ms,
+        "config_digest": digest,
+        "repositories": repository_rows,
+        "observations": observations,
+    }
+    snapshot_id = hashlib.sha256(
+        json.dumps(snapshot_material, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return GitDiscovery(
+        schema_version=GIT_DISCOVERY_SCHEMA_VERSION,
+        epoch=epoch_n,
+        snapshot_id=snapshot_id,
+        timestamp_ms=boundary_ms,
+        config_digest=digest,
+        initial_snapshot=initial,
+        configuration=config,
+        repositories=repository_rows,
+        observations=observations,
+        commits=commits,
     )
-    resp.raise_for_status()
-    return unified_diff_from_commit_payload(resp.json())
+
+
+def _acquire_discovery_file_lock():
+    GIT_MIRROR_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = (GIT_MIRROR_DIR / ".discovery.lock").open("a+b")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    return lock_file
+
+
+def _release_discovery_file_lock(lock_file) -> None:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    lock_file.close()
+
+
+async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
+    async with _DISCOVERY_LOCK:
+        lock_file = await asyncio.to_thread(_acquire_discovery_file_lock)
+        try:
+            events = store.read()
+            existing = next(
+                (
+                    e for e in events
+                    if isinstance(e, GitDiscovery) and e.epoch == epoch_n
+                ),
+                None,
+            )
+            if existing:
+                return existing
+            candidate = await asyncio.to_thread(
+                _build_discovery, epoch_n, boundary_ms, events
+            )
+
+            def append_if_new(current_events):
+                if any(
+                    isinstance(e, GitDiscovery) and e.epoch == epoch_n
+                    for e in current_events
+                ):
+                    return None
+                return candidate
+
+            appended = await store.atomic(append_if_new)
+            if appended:
+                return appended
+            return next(
+                e for e in store.read()
+                if isinstance(e, GitDiscovery) and e.epoch == epoch_n
+            )
+        finally:
+            await asyncio.to_thread(_release_discovery_file_lock, lock_file)
 
 
 SSE_CLIENTS = []
@@ -581,28 +1002,27 @@ async def broadcast_js(js: str):
         await queue.put(js)
 
 
-async def rank_commits(since_ms):
-    commits = await fetch_commits_since(since_ms)
+async def rank_commits(commits: list[dict]):
     if not commits:
-        return {}
-
-    async with httpx.AsyncClient() as gh:
-        commit_diffs = await asyncio.gather(*[fetch_commit_unified_diff(gh, c["sha"]) for c in commits])
+        return {}, []
 
     models = await fetch_top_models(n=3)
+    contributors = sorted(set(c["contributor"] for c in commits))
+    if len(contributors) > 1 and not models:
+        raise RuntimeError("no council models available for contributor ranking")
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-council", f"Council: {', '.join(models)} — {len(commits)} commits"]
     ]))
 
-    authors = list(set(c["commit"]["author"]["name"] for c in commits))
+    authors = contributors
     author_idx = {a: i for i, a in enumerate(authors)}
 
     author_commits = {a: [] for a in authors}
-    for c, diff_text in zip(commits, commit_diffs, strict=True):
-        author_commits[c["commit"]["author"]["name"]].append({
-            "message": c["commit"]["message"],
-            "sha": c["sha"][:8],
-            "diff": diff_text,
+    for c in sorted(commits, key=lambda row: row["oid"]):
+        author_commits[c["contributor"]].append({
+            "message": c["message"],
+            "sha": c["oid"].split(":", 1)[1][:8],
+            "diff": c["patch"],
         })
 
     # TODO do we want ot coagulate the commits into a single block? or rank the many commits
@@ -622,9 +1042,14 @@ async def rank_commits(since_ms):
         for model in models:
             try:
                 result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
+                if result["winner"] not in {"A", "B"}:
+                    raise ValueError("winner must be A or B")
                 w, l = (i, j) if result["winner"] == "A" else (j, i)
                 ratio = result["ratio"].split(":")
-                results.append((w, l, float(ratio[0]), float(ratio[1])))
+                winner_weight, loser_weight = float(ratio[0]), float(ratio[1])
+                if winner_weight <= 0 or loser_weight <= 0:
+                    raise ValueError("ratio weights must be positive")
+                results.append((w, l, winner_weight, loser_weight))
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-vote",
                         ["span.model", model], " — ",
@@ -637,6 +1062,7 @@ async def rank_commits(since_ms):
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-error", f"⚠ {model}: {e}"]
                 ]))
+                raise RuntimeError(f"council model failed: {model}") from e
         return results
 
     async def progress_fn(ev):
@@ -651,7 +1077,8 @@ async def rank_commits(since_ms):
     pairs = await pairwise_rank(len(authors), compare_fn, progress_fn)
 
     if not pairs:
-        return {authors[0]: Decimal("1")} if authors else {}
+        ranking = {authors[0]: Decimal("1")} if authors else {}
+        return ranking, models
 
     scores = rank_centrality(pairs)
     ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
@@ -662,7 +1089,7 @@ async def rank_commits(since_ms):
             *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in ranking_rows],
         ]
     ]))
-    return ranking
+    return ranking, models
 
 
 # ===========================================================================
@@ -681,35 +1108,48 @@ async def run_emission(epoch_n, boundary_ms):
         ["div.log-start", f"⚡ Epoch {epoch_n} emission started"]
     ]))
 
-    pool = pool_remaining(store.read())
-    emission = pool * DECAY_RATE
-    await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
-        ["div.log-amount",
-            f"Pool {pool:.4f} → emit {emission:.4f} → {pool - emission:.4f}"]
-    ]))
-
-    prev_boundary_ms = epoch_boundary(epoch_n - 1) if epoch_n > 0 else GENESIS_MS
-    ranking = await rank_commits(prev_boundary_ms)
+    discovery = await discover_repositories(epoch_n, boundary_ms)
+    ranking, models = await rank_commits(discovery.commits)
 
     def make_emission(events):
         if epoch_n in {e.epoch for e in events if isinstance(e, Emission)}:
             return None
         pool_now = pool_remaining(events)
-        emission_now = pool_now * DECAY_RATE
+        emission_now = pool_now * DECAY_RATE if ranking else Decimal("0")
+        normalized_ranking = {}
+        distributions = {}
+        if ranking:
+            score_total = sum(ranking.values())
+            normalized_ranking = {
+                contributor: score / score_total
+                for contributor, score in sorted(ranking.items())
+            }
+            contributors = list(normalized_ranking)
+            allocated = Decimal("0")
+            for contributor in contributors[:-1]:
+                amount = emission_now * normalized_ranking[contributor]
+                distributions[contributor] = amount
+                allocated += amount
+            distributions[contributors[-1]] = emission_now - allocated
         return Emission(
             epoch=epoch_n,
             timestamp_ms=boundary_ms,
+            discovery_snapshot_id=discovery.snapshot_id,
             pool_before=str(pool_now),
             total_emitted=str(emission_now),
             pool_after=str(pool_now - emission_now),
             decay_rate=str(DECAY_RATE),
-            distributions={a: str(emission_now * s) for a, s in ranking.items()},
-            ranking={a: str(s) for a, s in ranking.items()},
-            models_used=[],
+            distributions={a: str(amount) for a, amount in distributions.items()},
+            ranking={a: str(s) for a, s in normalized_ranking.items()},
+            models_used=models,
         )
 
     entry = await store.atomic(make_emission)
     if entry:
+        await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
+            ["div.log-amount",
+                f"Pool {entry.pool_before} → emit {entry.total_emitted} → {entry.pool_after}"]
+        ]))
         await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
             ["div.log-complete",
                 ["b", f"✓ Epoch {entry.epoch} complete — emitted {entry.total_emitted} SLUG"]]
@@ -815,20 +1255,40 @@ async def get_contributor(github_username: str):
 
 @app.get("/api/halvening")
 async def get_halvening():
-    half_life = sp.Rational(str(HALF_LIFE_YEARS))
-    boundary = genesis_ms
-    elapsed = sp.Integer(0)
-    epoch_years = sp.Rational(1, 12)
-    for e in range(300):
-        epoch_dur = tropical_epoch_ms(boundary)
-        if elapsed + epoch_years >= half_life:
-            fraction = (half_life - elapsed) / epoch_years
-            jubilee_ms = round_sympy_ms(boundary + fraction * epoch_dur)
-            dt = datetime.fromtimestamp(jubilee_ms / 1000, tz=timezone.utc)
-            return {"jubilee_ms": jubilee_ms, "jubilee_utc": dt.isoformat(),
-                    "epoch": e + float(fraction), "half_life_years": str(HALF_LIFE_YEARS)}
-        elapsed += epoch_years
-        boundary += epoch_dur
+    # Iterating symbolic rationals recursively causes expression-size explosion
+    # after hundreds of epochs. Fifty-digit Decimal arithmetic is far beyond the
+    # millisecond precision exposed by this endpoint and remains deterministic.
+    boundary = Decimal(GENESIS_MS)
+    j2000 = Decimal(946728000000)
+    century = Decimal(36525 * 86400 * 1000)
+    day = Decimal(86400000)
+
+    def decimal_epoch_ms(at_ms: Decimal) -> Decimal:
+        T = (at_ms - j2000) / century
+        days = (
+            Decimal("365.2421896698")
+            + Decimal("-6.15359e-6") * T
+            + Decimal("-7.29e-10") * T**2
+            + Decimal("2.64e-10") * T**3
+        )
+        return days * day / Decimal(12)
+
+    total_epochs = HALF_LIFE_YEARS * Decimal(12)
+    whole_epochs = int(total_epochs)
+    fraction = total_epochs - whole_epochs
+    for _ in range(whole_epochs):
+        boundary += decimal_epoch_ms(boundary)
+    jubilee_ms = int(
+        (boundary + fraction * decimal_epoch_ms(boundary))
+        .to_integral_value(rounding="ROUND_HALF_UP")
+    )
+    dt = datetime.fromtimestamp(jubilee_ms / 1000, tz=timezone.utc)
+    return {
+        "jubilee_ms": jubilee_ms,
+        "jubilee_utc": dt.isoformat(),
+        "epoch": float(total_epochs),
+        "half_life_years": str(HALF_LIFE_YEARS),
+    }
 
 
 @app.post("/test/emit")

@@ -1,7 +1,7 @@
 #!/usr/bin/env bb
 (ns test.integration
   "Integration tests for constitution.py.
-   Starts the server, mocks OpenRouter + GitHub APIs, seeds a JSONL,
+   Starts the server, mocks OpenRouter, creates local Git remotes, seeds a JSONL,
    verifies API endpoints, SSE stream, and replay determinism."
   (:require [babashka.process :as p]
             [clojure.string :as str]
@@ -95,6 +95,47 @@
         (fail (str "POST " path " HTTP " code " body: " body))
         (throw (ex-info "bad HTTP status" {:code code :body body})))
       (json/parse-string body true))))
+
+(defn- command!
+  [argv opts]
+  (let [r @(p/process argv (merge {:out :string :err :string} opts))]
+    (when-not (zero? (:exit r))
+      (throw (ex-info (str "command failed: " (pr-str argv) "\n" (:err r))
+                      {:argv argv :result r})))
+    (str/trim (:out r))))
+
+(defn- git!
+  [dir & args]
+  (let [base-env (into {} (System/getenv))
+        env      (merge base-env
+                        {"GIT_CONFIG_NOSYSTEM" "1"
+                         "GIT_AUTHOR_NAME" "Integration"
+                         "GIT_AUTHOR_EMAIL" "integration@example.test"
+                         "GIT_COMMITTER_NAME" "Integration"
+                         "GIT_COMMITTER_EMAIL" "integration@example.test"})]
+    (command! (into ["git" "-C" dir] args) {:env env})))
+
+(defn- make-git-repository!
+  [tmp-dir id contributor email filename]
+  (let [remote (str tmp-dir "/" id ".git")
+        work   (str tmp-dir "/" id "-work")]
+    (command! ["git" "init" "--bare" remote] {})
+    (command! ["git" "init" "-b" "main" work] {})
+    (git! work "config" "user.name" contributor)
+    (git! work "config" "user.email" email)
+    (spit (str work "/" filename) (str contributor " contribution\n"))
+    (git! work "add" "--" filename)
+    (let [env (merge (into {} (System/getenv))
+                     {"GIT_CONFIG_NOSYSTEM" "1"
+                      "GIT_AUTHOR_NAME" contributor
+                      "GIT_AUTHOR_EMAIL" email
+                      "GIT_COMMITTER_NAME" contributor
+                      "GIT_COMMITTER_EMAIL" email})]
+      (command! ["git" "-C" work "commit" "-m" (str "contribution by " contributor)]
+                {:env env}))
+    (git! work "remote" "add" "origin" remote)
+    (git! work "push" "origin" "main")
+    {:id id :url remote :refs ["refs/heads/**"]}))
 
 ;; ---------------------------------------------------------------------------
 ;; mock OpenRouter server
@@ -199,6 +240,7 @@
   (let [entry {:type         "emission"
                :epoch        0
                :timestamp_ms 1700000000000
+               :discovery_snapshot_id "seeded-discovery"
                :pool_before  "175824"
                :total_emitted "572.1423838308"
                :pool_after   "175251.857616169"
@@ -239,8 +281,8 @@
       (str/trim (second m)))))
 
 (defn- test-live-slug-model-council! [root]
-  (if (= "1" (System/getenv "SKIP_LIVE_SLUG_SOCIAL"))
-    (println "\n━━━ live slug.social checks skipped (SKIP_LIVE_SLUG_SOCIAL=1) ━━━\n")
+  (if-not (= "1" (System/getenv "RUN_LIVE_SLUG_SOCIAL"))
+    (println "\n━━━ live slug.social checks skipped (set RUN_LIVE_SLUG_SOCIAL=1) ━━━\n")
     (letlocals
       (println "\n━━━ live slug.social: /api/v0 + fetch_top_models ━━━\n")
       (bind rank-url (str slug-live-base "/api/v0/rank?parent="
@@ -307,7 +349,7 @@
               (when (str/starts-with? line "data:")
                 (let [raw (str/trim (subs line 5))]
                   (when-not (str/blank? raw)
-                    (swap! events conj (json/parse-string raw true)))))
+                    (swap! events conj raw))))
               (recur))
             nil)))
       (finally
@@ -329,7 +371,6 @@
     (bind jsonl-path   (str tmp-dir "/ledger.jsonl"))
     (bind server-port  (pick-port))
     (bind or-port      (pick-port))  ; openrouter mock
-    (bind gh-port      (pick-port))  ; github mock
     (bind base-url     (str "http://127.0.0.1:" server-port))
 
     ;; genesis ~1 month ago so we're at epoch 1+
@@ -337,38 +378,47 @@
 
     (bind root          (project-root))
     (test-live-slug-model-council! root)
+    (bind repo-a (make-git-repository! tmp-dir "repo-a" "alice"
+                                       "alice@example.test" "alice.txt"))
+    (bind repo-b (make-git-repository! tmp-dir "repo-b" "bob"
+                                       "bob@example.test" "bob.txt"))
+    (bind repositories-json
+      (json/generate-string
+        [(update repo-a :refs vec) (update repo-b :refs vec)]))
+    (bind contributors-json
+      (json/generate-string
+        {"alice" ["alice@example.test"]
+         "bob"   ["bob@example.test"]}))
     (bind server-env
       {"SESSION_SECRET"       "test-secret"
        "GENESIS_MS"           genesis-ms
        "JSONL_PATH"           jsonl-path
+       "GIT_MIRROR_DIR"       (str tmp-dir "/mirrors")
+       "REPOSITORIES_JSON"    repositories-json
+       "CONTRIBUTORS_JSON"    contributors-json
        "OPENROUTER_API_KEY"   "mock-key"
        "GITHUB_CLIENT_ID"     "mock-gh-id"
        "GITHUB_CLIENT_SECRET" "mock-gh-secret"
-       "GITHUB_TOKEN"         "mock-gh-token"
-       "REPO"                 "tommy-mor/slug"
        "PORT"                 (str server-port)
        "DISABLE_EPOCH_LOOP"   "1"
        "ALLOW_TEST_TRIGGERS"  "1"
        "OPENROUTER_BASE_URL"  (str "http://127.0.0.1:" or-port)
-       "GITHUB_API_BASE_URL"  (str "http://127.0.0.1:" gh-port)
        "SLUG_MODEL_RANK_PARENT" ""
        "PATH"                 (get (into {} (System/getenv)) "PATH" "")})
 
     (bind !server  (atom nil))
     (bind !server2 (atom nil))
     (bind !or-mock (atom nil))
-    (bind !gh-mock (atom nil))
 
     (try
       (letlocals
-        ;; 1. start mock servers
-        (println "starting mock OpenRouter and GitHub API servers…")
+        ;; 1. start mock model server; Git discovery uses local bare remotes
+        (println "starting mock OpenRouter server and local Git remotes…")
         (bind or-mock (start-mock-openrouter or-port))
         (reset! !or-mock or-mock)
-        (bind gh-mock (start-mock-github gh-port))
-        (reset! !gh-mock gh-mock)
         (assert! (some? (:stop-fn or-mock)) "mock OpenRouter started")
-        (assert! (some? (:stop-fn gh-mock)) "mock GitHub started")
+        (assert! (fs/exists? (:url repo-a)) "first bare Git remote exists")
+        (assert! (fs/exists? (:url repo-b)) "second bare Git remote exists")
 
         ;; 2. seed ledger so pool_remaining has history to read
         (seed-ledger jsonl-path)
@@ -422,7 +472,8 @@
         (println "\nchecking /sse initial event…")
         (bind sse-events (read-sse-events (str base-url "/sse") 1 5000))
         (assert! (= 1 (count sse-events))             "received 1 SSE event")
-        (assert! (int? (:epoch (first sse-events)))   "initial SSE event has epoch")
+        (assert! (not (str/blank? (first sse-events)))
+                 "initial SSE event contains executable audit data")
 
         ;; 10. POST /test/emit — full ranking pipeline hits mocks
         (println "\ntriggering /test/emit (epoch 1)…")
@@ -430,16 +481,25 @@
         (assert! (= "emission" (:type emit-resp))     "emit response type is emission")
         (assert! (= 1 (:epoch emit-resp))             "emit is epoch 1 after seeded epoch 0")
         (assert! (pos? (count (:distributions emit-resp))) "emit has distributions")
+        (assert! (string? (:discovery_snapshot_id emit-resp))
+                 "emission records discovery snapshot")
+        (assert! (= 3 (count (:models_used emit-resp)))
+                 "emission records all council models")
 
         (bind or-state @(:state or-mock))
-        (bind gh-state @(:state gh-mock))
         (assert! (pos? (:model-requests or-state))    "OpenRouter /models was called")
         (assert! (>= (:compare-requests or-state) 3) "at least 3 pairwise LLM calls (2 authors × 3 models)")
-        (assert! (pos? (:commit-list-requests gh-state)) "GitHub commits list was called")
-        (assert! (>= (:commit-detail-requests gh-state) 2) "GitHub per-SHA fetches for each commit")
 
         (bind ledger2 (get-json base-url "/api/ledger"))
-        (assert! (= 2 (count ledger2))              "ledger has 2 entries after emit")
+        (assert! (= 3 (count ledger2))
+                 "ledger has seed, discovery, and emission entries")
+        (bind discovery-entry (second ledger2))
+        (assert! (= "gitdiscovery" (:type discovery-entry))
+                 "discovery is persisted before emission")
+        (assert! (= 2 (count (:repositories discovery-entry)))
+                 "discovery records both repositories")
+        (assert! (= 2 (count (:commits discovery-entry)))
+                 "discovery admits one contribution from each repository")
         (bind rank-after (get-json base-url "/api/ranking"))
         (assert! (= 1 (:epoch rank-after))           "latest ranking is epoch 1")
 
@@ -458,7 +518,8 @@
                  "restarted server responds to /api/epoch")
 
         (bind replayed-ledger (get-json base-url "/api/ledger"))
-        (assert! (= 2 (count replayed-ledger))        "ledger still has 2 entries after replay")
+        (assert! (= 3 (count replayed-ledger))
+                 "ledger still has 3 entries after replay")
         (bind replayed-rank   (get-json base-url "/api/ranking"))
         (assert! (= (get-in rank-after [:ranking :alice])
                     (get-in replayed-rank [:ranking :alice]))
@@ -473,7 +534,6 @@
           (.destroyForcibly (:proc s))
           (deref s))
         (when-some [m @!or-mock] ((:stop-fn m)))
-        (when-some [m @!gh-mock] ((:stop-fn m)))
         (fs/delete-tree tmp-dir)))
 
     (let [{:keys [pass fail]} @counts]

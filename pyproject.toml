@@ -3,7 +3,7 @@ name = "slug-constitution"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "evaleval>=0.2.6",
+    "evaleval==0.2.7",
     "numpy",
     "httpx",
     "fastapi",
@@ -12,6 +12,10 @@ dependencies = [
     "starlette",
     "itsdangerous",
     "pytest",
+    "hypothesis",
+    "sympy",
+    "authlib",
+    "python-multipart",
 ]
 
 [tool.pytest.ini_options]
