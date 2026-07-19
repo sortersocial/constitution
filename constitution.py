@@ -2211,6 +2211,12 @@ async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
     return rows
 
 
+@app.get("/api/health")
+async def get_health():
+    """Liveness only — must not touch the ledger (health checks during ranking)."""
+    return {"ok": True}
+
+
 @app.get("/api/epoch")
 async def get_epoch():
     epoch_n, start, next_b = current_epoch()
@@ -2397,11 +2403,20 @@ def _side_label(side: dict) -> str:
     return f"{_short_id(cid, 14)} ({who})"
 
 
+def _judgments_by_comparison(
+    judgments: list[Evidence] | None = None,
+) -> dict[str, list[Evidence]]:
+    rows = judgments if judgments is not None else evidence_by_kind("llm.judgment")
+    out: dict[str, list[Evidence]] = {}
+    for e in rows:
+        cid = e.payload.get("comparison_id")
+        if cid:
+            out.setdefault(str(cid), []).append(e)
+    return out
+
+
 def _judgments_for_comparison(comparison_id: str) -> list[Evidence]:
-    return [
-        e for e in evidence_by_kind("llm.judgment")
-        if e.payload.get("comparison_id") == comparison_id
-    ]
+    return _judgments_by_comparison().get(comparison_id, [])
 
 
 def _judgment_blocks(judgments: list[Evidence]) -> list:
@@ -2542,6 +2557,8 @@ async def epoch_detail(epoch: int):
     }
 
     # Dense comparison cards with inline reasoning (permalinks kept).
+    # Index judgments once — never rescan the full ledger per comparison.
+    judgments_by_cmp = _judgments_by_comparison(judgment_evs)
     comparison_cards: list = []
     disagreement_cards: list = []
     for cmp in comparison_evs:
@@ -2550,7 +2567,7 @@ async def epoch_detail(epoch: int):
             continue
         side_a = cmp.payload.get("side_a") or {}
         side_b = cmp.payload.get("side_b") or {}
-        juds = _judgments_for_comparison(cid)
+        juds = judgments_by_cmp.get(cid, [])
         reason_lines = []
         winners: set[str] = set()
         for j in juds:
@@ -2735,6 +2752,7 @@ async def commit_detail(commit_id: str):
         ])
     p = ev.payload
     epoch = ev.epoch
+    judgments_by_cmp = _judgments_by_comparison()
     related_cmp = []
     for cmp in evidence_by_kind("comparison.input"):
         if cmp.epoch != epoch:
@@ -2751,7 +2769,6 @@ async def commit_detail(commit_id: str):
         cid = cmp.payload.get("comparison_id")
         if not cid:
             continue
-        juds = _judgments_for_comparison(cid)
         related_cmp.append(["article.dense-card",
             ["div.card-head",
                 _a(_evidence_path("comparison", cid), "comparison"),
@@ -2760,7 +2777,7 @@ async def commit_detail(commit_id: str):
                 " vs ",
                 _side_label(sb),
             ],
-            *_judgment_blocks(juds),
+            *_judgment_blocks(judgments_by_cmp.get(cid, [])),
         ])
     return _evidence_page(f"commit {commit_id[:24]}", [
         _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),

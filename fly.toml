@@ -20,16 +20,16 @@ primary_region = "ord"
 
   [[http_service.checks]]
     interval = "30s"
-    timeout = "10s"
-    grace_period = "30s"
+    timeout = "5s"
+    grace_period = "180s"
     method = "GET"
-    path = "/api/epoch"
+    path = "/api/health"
 
 [[mounts]]
   source = "slug_data"
   destination = "/data"
 
 [[vm]]
-  memory = "2gb"
+  memory = "4gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2
