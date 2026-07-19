@@ -404,6 +404,7 @@
        "ALLOW_TEST_TRIGGERS"  "1"
        "OPENROUTER_BASE_URL"  (str "http://127.0.0.1:" or-port)
        "SLUG_MODEL_RANK_PARENT" ""
+       "PUBLIC_BASE_URL"      (str "http://127.0.0.1:" server-port)
        "PATH"                 (get (into {} (System/getenv)) "PATH" "")})
 
     (bind !server  (atom nil))
@@ -506,19 +507,55 @@
         (assert! (>= (:compare-requests or-state) 3) "at least 3 pairwise LLM calls (2 authors × 3 models)")
 
         (bind ledger2 (get-json base-url "/api/ledger"))
-        (assert! (= 3 (count ledger2))
-                 "ledger has seed, discovery, and emission entries")
-        (bind discovery-entry (second ledger2))
-        (assert! (= "gitdiscovery" (:type discovery-entry))
+        (assert! (>= (count ledger2) 3)
+                 "ledger has seed + discovery + emission (+ evidence)")
+        (bind discovery-entry
+          (first (filter #(= "gitdiscovery" (:type %)) ledger2)))
+        (assert! (some? discovery-entry)
                  "discovery is persisted before emission")
         (assert! (= 2 (count (:repositories discovery-entry)))
                  "discovery records both repositories")
         (assert! (= 2 (count (:commits discovery-entry)))
                  "discovery admits one contribution from each repository")
+        (bind evidence-kinds
+          (set (keep :kind (filter #(= "evidence" (:type %)) ledger2))))
+        (assert! (contains? evidence-kinds "git.commit")
+                 "evidence includes git.commit")
+        (assert! (contains? evidence-kinds "comparison.input")
+                 "evidence includes comparison.input")
+        (assert! (contains? evidence-kinds "llm.judgment")
+                 "evidence includes llm.judgment")
         (bind rank-after (get-json base-url "/api/ranking"))
         (assert! (= 1 (:epoch rank-after))           "latest ranking is epoch 1")
 
-        ;; 12. kill and restart — prove replay determinism
+        ;; 11b. HTML evidence indexes are crawlable
+        (println "\nchecking HTML evidence indexes…")
+        (bind epochs-html (slurp (str base-url "/epochs")))
+        (assert! (str/includes? epochs-html "/epochs/1")
+                 "epochs index links epoch 1")
+        (bind epoch-html (slurp (str base-url "/epochs/1")))
+        (assert! (str/includes? epoch-html "/commits/")
+                 "epoch page links commits")
+        (assert! (str/includes? epoch-html "/comparisons/")
+                 "epoch page links comparisons")
+        (assert! (str/includes? epoch-html "/judgments/")
+                 "epoch page links judgments")
+        (bind commit-href
+          (second (re-find #"/commits/(c_[a-f0-9]+)" epoch-html)))
+        (assert! (some? commit-href) "found a commit id on epoch page")
+        (bind commit-html (slurp (str base-url "/commits/" commit-href)))
+        (assert! (str/includes? commit-html "download patch")
+                 "commit page offers patch download")
+        (bind patch-bytes
+          (let [tmp (doto (java.io.File/createTempFile "patch" ".bin") .deleteOnExit)
+                r   @(p/process ["curl" "-sS" "-o" (.getAbsolutePath tmp)
+                                 (str base-url "/commits/" commit-href "/patch")]
+                                {:out :string :err :string})]
+            (assert! (zero? (:exit r)) "patch download succeeds")
+            (slurp tmp)))
+        (assert! (pos? (count patch-bytes)) "patch download is non-empty")
+
+        ;; 12. kill and restart — prove replay determinism + no duplicate LLM calls
         (println "\nkilling server for replay test…")
         (.destroyForcibly (:proc server))
         (deref server)
@@ -533,12 +570,15 @@
                  "restarted server responds to /api/epoch")
 
         (bind replayed-ledger (get-json base-url "/api/ledger"))
-        (assert! (= 3 (count replayed-ledger))
-                 "ledger still has 3 entries after replay")
+        (assert! (= (count ledger2) (count replayed-ledger))
+                 "ledger entry count unchanged after replay")
         (bind replayed-rank   (get-json base-url "/api/ranking"))
         (assert! (= (get-in rank-after [:ranking :alice])
                     (get-in replayed-rank [:ranking :alice]))
-                 "alice's rank score (epoch 1) identical after replay"))
+                 "alice's rank score (epoch 1) identical after replay")
+        (bind epoch-html2 (slurp (str base-url "/epochs/1")))
+        (assert! (str/includes? epoch-html2 "/judgments/")
+                 "epoch HTML evidence still linked after restart"))
 
       (finally
         (when-some [s @!server]

@@ -397,8 +397,8 @@ def test_empty_epoch_records_zero_emission_without_burning_pool(
             observations=[], commits=[], snapshot_id="empty-snapshot"
         )
 
-    async def rank(_commits):
-        return {}, []
+    async def rank(_commits, *, epoch=-1):
+        return {}, [], {"ranking_run_id": "", "ranking_event_id": ""}
 
     monkeypatch.setattr(c, "discover_repositories", discover)
     monkeypatch.setattr(c, "rank_commits", rank)
@@ -420,11 +420,11 @@ def test_emission_distribution_sums_exactly_to_total(
             snapshot_id="ranked-snapshot",
         )
 
-    async def rank(_commits):
+    async def rank(_commits, *, epoch=-1):
         return {
             "alice": c.Decimal("0.33333333333333333333333333333333333333333333333333"),
             "bob": c.Decimal("0.66666666666666666666666666666666666666666666666667"),
-        }, ["model"]
+        }, ["model"], {"ranking_run_id": "r", "ranking_event_id": "e"}
 
     monkeypatch.setattr(c, "discover_repositories", discover)
     monkeypatch.setattr(c, "rank_commits", rank)
@@ -435,27 +435,32 @@ def test_emission_distribution_sums_exactly_to_total(
 
 
 def test_single_contributor_ranking_is_total_and_uses_no_pairwise_votes(
-    monkeypatch,
+    discovery_config, monkeypatch,
 ):
+    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+
     async def models(n=3):
         return []
 
     monkeypatch.setattr(c, "fetch_top_models", models)
-    ranking, used = asyncio.run(c.rank_commits([{
+    ranking, used, info = asyncio.run(c.rank_commits([{
         "contributor": "alice",
         "oid": "sha1:" + "a" * 40,
         "message": "one contribution",
         "patch": "patch",
-    }]))
+    }], epoch=0))
     assert ranking == {"alice": c.Decimal("1")}
     assert used == []
+    assert info["ranking_event_id"]
 
 
-def test_any_council_failure_aborts_ranking(monkeypatch):
+def test_any_council_failure_aborts_ranking(discovery_config, monkeypatch):
+    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+
     async def models(n=3):
         return ["broken"]
 
-    async def compare(*_args):
+    async def compare(*_args, **_kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(c, "fetch_top_models", models)
@@ -471,7 +476,7 @@ def test_any_council_failure_aborts_ranking(monkeypatch):
         for contributor, char in [("alice", "a"), ("bob", "b")]
     ]
     with pytest.raises(RuntimeError, match="council model failed"):
-        asyncio.run(c.rank_commits(commits))
+        asyncio.run(c.rank_commits(commits, epoch=0))
 
 
 def test_contested_ranking_requires_openrouter_key(monkeypatch):

@@ -156,6 +156,8 @@ DEFAULT_REPOSITORIES = [
         "refs": ["refs/heads/**"],
     },
 ]
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://token.slug.social").rstrip("/")
+EVIDENCE_SCHEMA_VERSION = 2
 DEFAULT_CONTRIBUTORS = {
     "tommy-mor": ["thmorriss@gmail.com"],
     "christopher-whitman": [
@@ -206,6 +208,9 @@ class Emission:
     ranking: dict         # author -> score str
     models_used: list
     discovery_snapshot_id: str = ""  # empty only for pre-discovery ledger history
+    evidence_schema_version: int = 1
+    ranking_run_id: str = ""
+    ranking_event_id: str = ""
 
 
 @event
@@ -237,7 +242,299 @@ class GitDiscovery:
     commits: list
 
 
+@event
+class Evidence:
+    """Versioned, content-addressed constitutional evidence envelope."""
+    schema_version: int
+    event_id: str
+    epoch: int
+    kind: str
+    recorded_at_ms: int
+    previous_event_sha256: str
+    payload: dict
+
+
 store = JsonlStore(JSONL_PATH)
+_LEDGER_LOCK = asyncio.Lock()
+
+
+# ===========================================================================
+# §1e. EVIDENCE — content-addressed, append-only, publicly linkable
+# ===========================================================================
+#
+# Every epoch, commit, comparison input, provider attempt, and judgment is
+# recorded as Evidence. Authoritative payloads keep exact bytes as base64 plus
+# SHA-256; decoded text is for display only.
+
+
+def _canonical_json(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _bytes_blob(data: bytes | str) -> dict:
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    return {
+        "encoding": "base64",
+        "data": base64.b64encode(raw).decode("ascii"),
+        "byte_length": len(raw),
+        "sha256": _sha256_hex(raw),
+        "text": raw.decode("utf-8", "replace"),
+    }
+
+
+def _decode_blob(blob: dict | None) -> bytes:
+    if not blob:
+        return b""
+    return base64.b64decode(blob["data"].encode("ascii"))
+
+
+def _content_id(prefix: str, material) -> str:
+    digest = _sha256_hex(_canonical_json(material) if not isinstance(material, bytes) else material)
+    return f"{prefix}_{digest}"
+
+
+def _html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _evidence_path(kind: str, entity_id: str) -> str:
+    routes = {
+        "epoch": f"/epochs/{entity_id}",
+        "commit": f"/commits/{entity_id}",
+        "comparison": f"/comparisons/{entity_id}",
+        "attempt": f"/attempts/{entity_id}",
+        "judgment": f"/judgments/{entity_id}",
+        "event": f"/events/{entity_id}",
+    }
+    return routes[kind]
+
+
+def _evidence_url(kind: str, entity_id: str) -> str:
+    return PUBLIC_BASE_URL + _evidence_path(kind, entity_id)
+
+
+def _previous_event_sha256(events: list) -> str:
+    for event_ in reversed(events):
+        if isinstance(event_, Evidence):
+            return event_.event_id.split("_", 1)[-1]
+        if isinstance(event_, (GitDiscovery, Emission)):
+            return _sha256_hex(_canonical_json(to_dict(event_)))
+    return "0" * 64
+
+
+def _public_repo_row(repo: dict) -> dict:
+    """Strip credential-bearing clone URLs from published config."""
+    url = repo["url"]
+    if "@" in url and "://" in url:
+        scheme, rest = url.split("://", 1)
+        url = f"{scheme}://{rest.split('@', 1)[-1]}"
+    return {"id": repo["id"], "url": url, "refs": repo["refs"]}
+
+
+def _ledger_lock_path() -> pathlib.Path:
+    env = os.environ.get("LEDGER_LOCK_PATH")
+    if env:
+        return pathlib.Path(env)
+    return pathlib.Path(str(store.path) + ".lock")
+
+
+async def append_evidence(epoch: int, kind: str, payload: dict) -> Evidence:
+    """Durably append one Evidence event under process + file locks."""
+    # Logical identity ignores chain links / wall clock so restarts stay idempotent.
+    event_id = _content_id("ev", {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "epoch": epoch,
+        "kind": kind,
+        "payload": payload,
+    })
+    async with _LEDGER_LOCK:
+        lock_path = _ledger_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                events = store.read()
+                existing = next(
+                    (
+                        e for e in events
+                        if isinstance(e, Evidence) and e.event_id == event_id
+                    ),
+                    None,
+                )
+                if existing:
+                    return existing
+                recorded_at_ms = int(time.time() * 1000)
+                previous = _previous_event_sha256(events)
+                evidence = Evidence(
+                    schema_version=EVIDENCE_SCHEMA_VERSION,
+                    event_id=event_id,
+                    epoch=epoch,
+                    kind=kind,
+                    recorded_at_ms=recorded_at_ms,
+                    previous_event_sha256=previous,
+                    payload=payload,
+                )
+
+                def append_once(current):
+                    if any(
+                        isinstance(e, Evidence) and e.event_id == event_id
+                        for e in current
+                    ):
+                        return None
+                    return evidence
+
+                appended = await store.atomic(append_once)
+                result = appended or next(
+                    e for e in store.read()
+                    if isinstance(e, Evidence) and e.event_id == event_id
+                )
+                try:
+                    with open(store.path, "rb") as fh:
+                        os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    await broadcast_audit(
+        kind,
+        f"{kind}: {payload.get('summary') or event_id[:24]}",
+        phase=PROCESS_STATE.get("phase"),
+        progress=PROCESS_STATE.get("progress"),
+        evidence_event_id=result.event_id,
+        evidence_url=_evidence_url("event", result.event_id),
+    )
+    return result
+
+
+def evidence_by_kind(kind: str | None = None) -> list[Evidence]:
+    rows = [e for e in store.read() if isinstance(e, Evidence)]
+    if kind is None:
+        return rows
+    return [e for e in rows if e.kind == kind]
+
+
+def find_evidence(event_id: str) -> Evidence | None:
+    return next(
+        (e for e in store.read() if isinstance(e, Evidence) and e.event_id == event_id),
+        None,
+    )
+
+
+def find_evidence_payload(kind: str, key: str, value: str) -> Evidence | None:
+    for e in evidence_by_kind(kind):
+        if e.payload.get(key) == value:
+            return e
+    return None
+
+
+def commit_id_for_oid(oid: str) -> str:
+    return _content_id("c", {"oid": oid})
+
+
+def comparison_id_for(material: dict) -> str:
+    return _content_id("cmp", material)
+
+
+def attempt_id_for(comparison_id: str, model_id: str, attempt_number: int) -> str:
+    return _content_id("att", {
+        "comparison_id": comparison_id,
+        "model_id": model_id,
+        "attempt_number": attempt_number,
+    })
+
+
+def judgment_id_for(material: dict) -> str:
+    return _content_id("jud", material)
+
+
+def _blob_text(blob) -> str:
+    if blob is None:
+        return ""
+    if isinstance(blob, str):
+        return blob
+    if isinstance(blob, dict):
+        if isinstance(blob.get("text"), str):
+            return blob["text"]
+        try:
+            return _decode_blob(blob).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    return str(blob)
+
+
+def _discovery_for_epoch(epoch: int) -> GitDiscovery | None:
+    return next(
+        (
+            e for e in store.read()
+            if isinstance(e, GitDiscovery) and e.epoch == epoch
+        ),
+        None,
+    )
+
+
+def _emission_for_epoch(epoch: int) -> Emission | None:
+    return next(
+        (
+            e for e in store.read()
+            if isinstance(e, Emission) and e.epoch == epoch
+        ),
+        None,
+    )
+
+
+def _epochs_in_ledger() -> list[int]:
+    epochs: set[int] = set()
+    for e in store.read():
+        if isinstance(e, (GitDiscovery, Emission, Evidence)):
+            epochs.add(e.epoch)
+    return sorted(epochs)
+
+
+def _legacy_commit_row(commit_id: str) -> tuple[GitDiscovery | None, dict | None]:
+    for discovery in store.read():
+        if not isinstance(discovery, GitDiscovery):
+            continue
+        for commit in discovery.commits:
+            if commit_id_for_oid(commit["oid"]) == commit_id:
+                return discovery, commit
+    return None, None
+
+
+def _legacy_observation(commit_id: str) -> tuple[GitDiscovery | None, dict | None]:
+    for discovery in store.read():
+        if not isinstance(discovery, GitDiscovery):
+            continue
+        for obs in discovery.observations:
+            if commit_id_for_oid(obs["oid"]) == commit_id:
+                return discovery, obs
+    return None, None
+
+
+def build_pairwise_prompt(side_a: dict, side_b: dict) -> str:
+    return f"""You are ranking contributions to an open source project.
+Compare these two sides (each may be one or more commits). Decide which side contributed more.
+Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
+
+Side A — commit messages:
+{side_a['message']}
+
+Side A — unified diffs (full patches):
+{side_a['diff']}
+
+Side B — commit messages:
+{side_b['message']}
+
+Side B — unified diffs (full patches):
+{side_b['diff']}"""
 
 
 # ===========================================================================
@@ -565,45 +862,126 @@ async def fetch_top_models(n=3):
 
 
 def _retry_llm_pairwise(exc: BaseException) -> bool:
-    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError)):
+    if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in (408, 425, 429, 500, 502, 503, 504)
     return isinstance(exc, httpx.RequestError)
 
 
-@retry(
-    retry=retry_if_exception(_retry_llm_pairwise),
-    stop=stop_after_attempt(6),
-    wait=wait_exponential(multiplier=1, min=1, max=120),
-    reraise=True,
-)
-async def llm_pairwise_compare(model_id, side_a, side_b):
-    prompt = f"""You are ranking contributions to an open source project.
-Compare these two sides (each may be one or more commits). Decide which side contributed more.
-Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
+def _retry_wait_seconds(attempt_number: int) -> float:
+    return min(120.0, float(2 ** (attempt_number - 1)))
 
-Side A — commit messages:
-{side_a['message']}
 
-Side A — unified diffs (full patches):
-{side_a['diff']}
-
-Side B — commit messages:
-{side_b['message']}
-
-Side B — unified diffs (full patches):
-{side_b['diff']}"""
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
-        resp = await client.post(
-            f"{OPENROUTER_BASE_URL}/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            json={"model": model_id, "messages": [{"role": "user", "content": prompt}]},
+async def llm_pairwise_compare(
+    model_id,
+    side_a,
+    side_b,
+    *,
+    epoch: int | None = None,
+    comparison_id: str | None = None,
+    persist: bool = False,
+):
+    """Pairwise LLM compare. When persist=True, every attempt is ledger evidence."""
+    prompt = build_pairwise_prompt(side_a, side_b)
+    request_obj = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    request_bytes = _canonical_json(request_obj)
+    max_attempts = 6
+    last_error = None
+    for attempt_number in range(1, max_attempts + 1):
+        attempt_id = attempt_id_for(
+            comparison_id or "ad-hoc", model_id, attempt_number
         )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+        if persist and epoch is not None and comparison_id is not None:
+            await append_evidence(epoch, "llm.attempt_started", {
+                "attempt_id": attempt_id,
+                "comparison_id": comparison_id,
+                "model_id": model_id,
+                "attempt_number": attempt_number,
+                "summary": f"{model_id} attempt {attempt_number}",
+                "request": _bytes_blob(request_bytes),
+            })
+        started = time.monotonic()
+        raw_response = b""
+        http_status = None
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0)) as client:
+                resp = await client.post(
+                    f"{OPENROUTER_BASE_URL}/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    content=request_bytes,
+                )
+            http_status = resp.status_code
+            raw_response = resp.content
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            result = json.loads(content)
+            if result.get("winner") not in {"A", "B"}:
+                raise ValueError("winner must be A or B")
+            ratio_parts = str(result["ratio"]).split(":")
+            if len(ratio_parts) != 2:
+                raise ValueError("ratio must be N:M")
+            winner_weight, loser_weight = float(ratio_parts[0]), float(ratio_parts[1])
+            if winner_weight <= 0 or loser_weight <= 0:
+                raise ValueError("ratio weights must be positive")
+            if persist and epoch is not None and comparison_id is not None:
+                await append_evidence(epoch, "llm.attempt_finished", {
+                    "attempt_id": attempt_id,
+                    "comparison_id": comparison_id,
+                    "model_id": model_id,
+                    "attempt_number": attempt_number,
+                    "ok": True,
+                    "http_status": http_status,
+                    "response": _bytes_blob(raw_response),
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "summary": f"{model_id} attempt {attempt_number} ok",
+                })
+                await append_evidence(epoch, "llm.judgment", {
+                    "judgment_id": judgment_id_for({
+                        "attempt_id": attempt_id,
+                        "comparison_id": comparison_id,
+                        "model_id": model_id,
+                        "winner": result["winner"],
+                        "ratio": result["ratio"],
+                        "explanation": result.get("explanation", ""),
+                    }),
+                    "attempt_id": attempt_id,
+                    "comparison_id": comparison_id,
+                    "model_id": model_id,
+                    "winner": result["winner"],
+                    "ratio": result["ratio"],
+                    "explanation": result.get("explanation", ""),
+                    "summary": f"{model_id}: {result['winner']} ({result['ratio']})",
+                })
+            return result
+        except Exception as exc:
+            last_error = exc
+            retryable = _retry_llm_pairwise(exc)
+            if persist and epoch is not None and comparison_id is not None:
+                await append_evidence(epoch, "llm.attempt_finished", {
+                    "attempt_id": attempt_id,
+                    "comparison_id": comparison_id,
+                    "model_id": model_id,
+                    "attempt_number": attempt_number,
+                    "ok": False,
+                    "retryable": retryable,
+                    "http_status": http_status,
+                    "response": _bytes_blob(raw_response) if raw_response else None,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                    "summary": f"{model_id} attempt {attempt_number} failed",
+                })
+            if retryable and attempt_number < max_attempts:
+                await asyncio.sleep(_retry_wait_seconds(attempt_number))
+                continue
+            raise
+    raise RuntimeError(f"council model failed: {model_id}") from last_error
 
 
 # ===========================================================================
@@ -1007,6 +1385,56 @@ def _release_discovery_file_lock(lock_file) -> None:
     lock_file.close()
 
 
+async def _persist_discovery_evidence(discovery: GitDiscovery) -> None:
+    """Record commit + discovery-completed evidence for a snapshot (idempotent)."""
+    public_config = {
+        "repositories": [
+            _public_repo_row(r) for r in discovery.configuration["repositories"]
+        ],
+        "contributors": discovery.configuration["contributors"],
+    }
+    for commit in discovery.commits:
+        commit_id = commit_id_for_oid(commit["oid"])
+        await append_evidence(discovery.epoch, "git.commit", {
+            "commit_id": commit_id,
+            "oid": commit["oid"],
+            "contributor": commit["contributor"],
+            "message": _bytes_blob(commit["message"]),
+            "patch": _bytes_blob(commit["patch"] or ""),
+            "patch_sha256": commit.get("patch_sha256"),
+            "patch_identity": commit.get("patch_identity"),
+            "first_sources": commit.get("first_sources", []),
+            "committer_timestamp_ms": commit.get("committer_timestamp_ms"),
+            "summary": f"{commit['oid'][:20]} {commit['contributor']}",
+            "urls": {
+                "commit": _evidence_url("commit", commit_id),
+                "epoch": _evidence_url("epoch", str(discovery.epoch)),
+            },
+        })
+    await append_evidence(discovery.epoch, "git.discovery_completed", {
+        "snapshot_id": discovery.snapshot_id,
+        "config_digest": discovery.config_digest,
+        "configuration": public_config,
+        "observation_count": len(discovery.observations),
+        "eligible_count": len(discovery.commits),
+        "commit_ids": [commit_id_for_oid(c["oid"]) for c in discovery.commits],
+        "observations": [
+            {
+                "oid": o["oid"],
+                "eligible": o["eligible"],
+                "exclusion_reason": o.get("exclusion_reason"),
+                "commit_id": commit_id_for_oid(o["oid"]),
+            }
+            for o in discovery.observations
+        ],
+        "summary": (
+            f"Discovered {len(discovery.observations)} commits; "
+            f"{len(discovery.commits)} eligible"
+        ),
+        "urls": {"epoch": _evidence_url("epoch", str(discovery.epoch))},
+    })
+
+
 async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
     async with _DISCOVERY_LOCK:
         lock_file = await asyncio.to_thread(_acquire_discovery_file_lock)
@@ -1020,6 +1448,7 @@ async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
                 None,
             )
             if existing:
+                await _persist_discovery_evidence(existing)
                 return existing
             candidate = await asyncio.to_thread(
                 _build_discovery, epoch_n, boundary_ms, events
@@ -1034,12 +1463,12 @@ async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
                 return candidate
 
             appended = await store.atomic(append_if_new)
-            if appended:
-                return appended
-            return next(
+            discovery = appended or next(
                 e for e in store.read()
                 if isinstance(e, GitDiscovery) and e.epoch == epoch_n
             )
+            await _persist_discovery_evidence(discovery)
+            return discovery
         finally:
             await asyncio.to_thread(_release_discovery_file_lock, lock_file)
 
@@ -1068,6 +1497,9 @@ async def broadcast_audit(
     *,
     progress: int | None = None,
     phase: str | None = None,
+    evidence_event_id: str | None = None,
+    evidence_url: str | None = None,
+    links: dict | None = None,
 ) -> dict:
     global AUDIT_SEQUENCE
     AUDIT_SEQUENCE += 1
@@ -1083,6 +1515,12 @@ async def broadcast_audit(
         "message": message,
         **PROCESS_STATE,
     }
+    if evidence_event_id:
+        payload["evidence_event_id"] = evidence_event_id
+    if evidence_url:
+        payload["evidence_url"] = evidence_url
+    if links:
+        payload["links"] = links
     AUDIT_HISTORY.append(payload)
     del AUDIT_HISTORY[:-200]
     wire = _sse_event("audit", payload)
@@ -1097,27 +1535,91 @@ async def broadcast_js(js: str):
         await queue.put(js)
 
 
-async def rank_commits(commits: list[dict]):
-    if not commits:
-        return {}, []
+def _author_side_for_llm(author: str, author_commits: dict) -> dict:
+    cs = author_commits[author]
+    return {
+        "message": "\n".join(f"[{c['sha']}] {c['message']}" for c in cs),
+        "diff": "\n\n".join(f"=== {c['sha']} ===\n{c['diff']}" for c in cs),
+        "commit_ids": [c["commit_id"] for c in cs],
+        "contributor": author,
+    }
 
+
+def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
+    for e in evidence_by_kind("llm.judgment"):
+        p = e.payload
+        if p.get("comparison_id") == comparison_id and p.get("model_id") == model_id:
+            return p
+    return None
+
+
+def _find_ranking_models(ranking_run_id: str) -> list[str] | None:
+    for e in evidence_by_kind("ranking.started"):
+        if e.payload.get("ranking_run_id") == ranking_run_id:
+            models = e.payload.get("models")
+            if isinstance(models, list) and models:
+                return [str(m) for m in models]
+    return None
+
+
+async def rank_commits(commits: list[dict], *, epoch: int = -1):
+    if not commits:
+        return {}, [], {"ranking_run_id": "", "ranking_event_id": ""}
+
+    commit_ids = sorted(commit_id_for_oid(row["oid"]) for row in commits)
+    ranking_run_id = _content_id("rank", {
+        "epoch": epoch,
+        "commit_ids": commit_ids,
+    })
     contributors = sorted(set(c["contributor"] for c in commits))
+
     if len(contributors) == 1:
+        await append_evidence(epoch, "ranking.started", {
+            "ranking_run_id": ranking_run_id,
+            "commit_ids": commit_ids,
+            "contributors": contributors,
+            "models": [],
+            "summary": f"ranking epoch {epoch}: single contributor",
+        })
+        ranking = {contributors[0]: Decimal("1")}
+        completed = await append_evidence(epoch, "ranking.completed", {
+            "ranking_run_id": ranking_run_id,
+            "models": [],
+            "ranking": {contributors[0]: "1"},
+            "judgment_ids": [],
+            "summary": f"Only {contributors[0]} is eligible; rank is 1.0",
+        })
         await broadcast_audit(
             "ranking",
             f"Only {contributors[0]} is eligible; rank is 1.0",
             progress=90,
             phase="finalizing",
+            evidence_event_id=completed.event_id,
+            evidence_url=_evidence_url("event", completed.event_id),
+            links={"epoch": _evidence_url("epoch", str(epoch))},
         )
-        return {contributors[0]: Decimal("1")}, []
+        return ranking, [], {
+            "ranking_run_id": ranking_run_id,
+            "ranking_event_id": completed.event_id,
+        }
+
     if not (OPENROUTER_API_KEY or "").strip():
         raise RuntimeError(
             "OPENROUTER_API_KEY is required when multiple contributors need ranking"
         )
 
-    models = await fetch_top_models(n=3)
+    models = _find_ranking_models(ranking_run_id)
+    if models is None:
+        models = await fetch_top_models(n=3)
     if not models:
         raise RuntimeError("no council models available for contributor ranking")
+    await append_evidence(epoch, "ranking.started", {
+        "ranking_run_id": ranking_run_id,
+        "commit_ids": commit_ids,
+        "contributors": contributors,
+        "models": models,
+        "summary": f"Council selected: {', '.join(models)}",
+    })
     await broadcast_audit(
         "council",
         f"Council selected: {', '.join(models)}",
@@ -1129,30 +1631,55 @@ async def rank_commits(commits: list[dict]):
     ]))
 
     authors = contributors
-    author_idx = {a: i for i, a in enumerate(authors)}
-
     author_commits = {a: [] for a in authors}
-    for c in sorted(commits, key=lambda row: row["oid"]):
-        author_commits[c["contributor"]].append({
-            "message": c["message"],
-            "sha": c["oid"].split(":", 1)[1][:8],
-            "diff": c["patch"],
+    for row in sorted(commits, key=lambda r: r["oid"]):
+        author_commits[row["contributor"]].append({
+            "message": row["message"],
+            "sha": row["oid"].split(":", 1)[1][:8],
+            "diff": row["patch"],
+            "commit_id": commit_id_for_oid(row["oid"]),
         })
 
-    # TODO do we want ot coagulate the commits into a single block? or rank the many commits
-    def author_side_for_llm(author):
-        cs = author_commits[author]
-        return {
-            "message": "\n".join(f"[{c['sha']}] {c['message']}" for c in cs),
-            "diff": "\n\n".join(f"=== {c['sha']} ===\n{c['diff']}" for c in cs),
-        }
+    judgment_ids: list[str] = []
 
     async def compare_fn(i, j):
         a1, a2 = authors[i], authors[j]
+        side_a = _author_side_for_llm(a1, author_commits)
+        side_b = _author_side_for_llm(a2, author_commits)
+        prompt = build_pairwise_prompt(side_a, side_b)
+        comparison_material = {
+            "ranking_run_id": ranking_run_id,
+            "side_a": {
+                "contributor": a1,
+                "commit_ids": side_a["commit_ids"],
+                "message": _bytes_blob(side_a["message"]),
+                "diff": _bytes_blob(side_a["diff"]),
+            },
+            "side_b": {
+                "contributor": a2,
+                "commit_ids": side_b["commit_ids"],
+                "message": _bytes_blob(side_b["message"]),
+                "diff": _bytes_blob(side_b["diff"]),
+            },
+            "prompt": _bytes_blob(prompt),
+        }
+        comparison_id = comparison_id_for(comparison_material)
+        comparison_material = {
+            **comparison_material,
+            "comparison_id": comparison_id,
+            "summary": f"Comparing {a1} with {a2}",
+        }
+        cmp_ev = await append_evidence(epoch, "comparison.input", comparison_material)
         await broadcast_audit(
             "comparison",
             f"Comparing {a1} with {a2}",
             phase="ranking",
+            evidence_event_id=cmp_ev.event_id,
+            evidence_url=_evidence_url("comparison", comparison_id),
+            links={
+                "comparison": _evidence_url("comparison", comparison_id),
+                "epoch": _evidence_url("epoch", str(epoch)),
+            },
         )
         await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
             ["div#emission-status", f"Comparing {a1} vs {a2}…"]
@@ -1160,19 +1687,46 @@ async def rank_commits(commits: list[dict]):
         results = []
         for model in models:
             try:
-                result = await llm_pairwise_compare(model, author_side_for_llm(a1), author_side_for_llm(a2))
-                if result["winner"] not in {"A", "B"}:
-                    raise ValueError("winner must be A or B")
+                existing = _find_judgment(comparison_id, model)
+                if existing:
+                    result = {
+                        "winner": existing["winner"],
+                        "ratio": existing["ratio"],
+                        "explanation": existing.get("explanation", ""),
+                    }
+                    judgment_ids.append(existing["judgment_id"])
+                else:
+                    result = await llm_pairwise_compare(
+                        model,
+                        side_a,
+                        side_b,
+                        epoch=epoch,
+                        comparison_id=comparison_id,
+                        persist=True,
+                    )
+                    judgment = _find_judgment(comparison_id, model)
+                    if judgment:
+                        judgment_ids.append(judgment["judgment_id"])
                 w, l = (i, j) if result["winner"] == "A" else (j, i)
                 ratio = result["ratio"].split(":")
                 winner_weight, loser_weight = float(ratio[0]), float(ratio[1])
-                if winner_weight <= 0 or loser_weight <= 0:
-                    raise ValueError("ratio weights must be positive")
                 results.append((w, l, winner_weight, loser_weight))
+                jud_id = (existing or _find_judgment(comparison_id, model) or {}).get(
+                    "judgment_id"
+                )
                 await broadcast_audit(
                     "vote",
                     f"{model}: {authors[w]} over {authors[l]} ({result['ratio']})",
                     phase="ranking",
+                    evidence_url=(
+                        _evidence_url("judgment", jud_id) if jud_id else None
+                    ),
+                    links={
+                        "judgment": (
+                            _evidence_url("judgment", jud_id) if jud_id else None
+                        ),
+                        "comparison": _evidence_url("comparison", comparison_id),
+                    },
                 )
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-vote",
@@ -1212,16 +1766,25 @@ async def rank_commits(commits: list[dict]):
 
     if not pairs:
         ranking = {authors[0]: Decimal("1")} if authors else {}
-        return ranking, models
-
-    scores = rank_centrality(pairs)
-    ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
+    else:
+        scores = rank_centrality(pairs)
+        ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
     ranking_rows = sorted(ranking.items(), key=lambda x: x[1], reverse=True)
+    completed = await append_evidence(epoch, "ranking.completed", {
+        "ranking_run_id": ranking_run_id,
+        "models": models,
+        "ranking": {a: str(s) for a, s in ranking_rows},
+        "judgment_ids": judgment_ids,
+        "summary": "Ranking: " + ", ".join(f"{a} {s:.4f}" for a, s in ranking_rows),
+    })
     await broadcast_audit(
         "ranking",
         "Ranking: " + ", ".join(f"{a} {s:.4f}" for a, s in ranking_rows),
         progress=90,
         phase="finalizing",
+        evidence_event_id=completed.event_id,
+        evidence_url=_evidence_url("event", completed.event_id),
+        links={"epoch": _evidence_url("epoch", str(epoch))},
     )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-ranking",
@@ -1229,7 +1792,10 @@ async def rank_commits(commits: list[dict]):
             *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in ranking_rows],
         ]
     ]))
-    return ranking, models
+    return ranking, models, {
+        "ranking_run_id": ranking_run_id,
+        "ranking_event_id": completed.event_id,
+    }
 
 
 # ===========================================================================
@@ -1245,11 +1811,19 @@ def pool_remaining(events: list) -> Decimal:
 
 async def run_emission(epoch_n, boundary_ms):
     PROCESS_STATE["running"] = True
+    started = await append_evidence(epoch_n, "epoch.started", {
+        "boundary_ms": boundary_ms,
+        "summary": f"Epoch {epoch_n} emission started",
+        "urls": {"epoch": _evidence_url("epoch", str(epoch_n))},
+    })
     await broadcast_audit(
         "start",
         f"Epoch {epoch_n} emission started",
         progress=2,
         phase="starting",
+        evidence_event_id=started.event_id,
+        evidence_url=_evidence_url("epoch", str(epoch_n)),
+        links={"epoch": _evidence_url("epoch", str(epoch_n))},
     )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-start", f"⚡ Epoch {epoch_n} emission started"]
@@ -1270,8 +1844,21 @@ async def run_emission(epoch_n, boundary_ms):
         ),
         progress=30,
         phase="discovery",
+        links={
+            "epoch": _evidence_url("epoch", str(epoch_n)),
+            **{
+                f"commit_{i}": _evidence_url("commit", commit_id_for_oid(c["oid"]))
+                for i, c in enumerate(discovery.commits[:12])
+                if isinstance(c, dict) and c.get("oid")
+            },
+        },
     )
-    ranking, models = await rank_commits(discovery.commits)
+    ranked = await rank_commits(discovery.commits, epoch=epoch_n)
+    if len(ranked) == 2:
+        ranking, models = ranked
+        ranking_info = {}
+    else:
+        ranking, models, ranking_info = ranked
 
     def make_emission(events):
         if epoch_n in {e.epoch for e in events if isinstance(e, Emission)}:
@@ -1304,6 +1891,9 @@ async def run_emission(epoch_n, boundary_ms):
             distributions={a: str(amount) for a, amount in distributions.items()},
             ranking={a: str(s) for a, s in normalized_ranking.items()},
             models_used=models,
+            evidence_schema_version=EVIDENCE_SCHEMA_VERSION,
+            ranking_run_id=ranking_info.get("ranking_run_id", ""),
+            ranking_event_id=ranking_info.get("ranking_event_id", ""),
         )
 
     entry = await store.atomic(make_emission)
@@ -1392,9 +1982,71 @@ async def epoch_loop():
 # §8. API — 2-line read forwards + computed endpoints
 # ===========================================================================
 
+def _evidence_summary(event_: Evidence) -> dict:
+    payload = event_.payload
+    summary = {
+        "type": "evidence",
+        "schema_version": event_.schema_version,
+        "event_id": event_.event_id,
+        "epoch": event_.epoch,
+        "kind": event_.kind,
+        "recorded_at_ms": event_.recorded_at_ms,
+        "previous_event_sha256": event_.previous_event_sha256,
+        "summary": payload.get("summary"),
+        "urls": {"event": _evidence_url("event", event_.event_id)},
+    }
+    for key in (
+        "commit_id", "comparison_id", "attempt_id", "judgment_id",
+        "ranking_run_id", "snapshot_id", "oid", "model_id",
+    ):
+        if key in payload:
+            summary[key] = payload[key]
+    return summary
+
+
+def _strip_heavy_fields(obj: dict) -> dict:
+    """Bounded listing: drop multi-megabyte blobs unless full=1."""
+    out = {}
+    for key, value in obj.items():
+        if key in {"patch", "message", "prompt", "request", "response", "diff"}:
+            if isinstance(value, dict) and "sha256" in value:
+                out[key] = {
+                    "sha256": value["sha256"],
+                    "byte_length": value.get("byte_length"),
+                    "encoding": value.get("encoding"),
+                }
+            elif isinstance(value, str) and len(value) > 256:
+                out[key] = value[:256] + "…"
+            else:
+                out[key] = value
+        elif key == "commits" and isinstance(value, list):
+            out[key] = [
+                {
+                    k: v for k, v in row.items()
+                    if k != "patch"
+                } | (
+                    {"patch_sha256": row.get("patch_sha256")}
+                    if isinstance(row, dict) else {}
+                )
+                for row in value
+            ]
+        else:
+            out[key] = value
+    return out
+
+
 @app.get("/api/ledger")
-async def get_ledger(offset: int = 0, limit: int = 100):
-    return [to_dict(e) for e in store.read()[offset:offset + limit]]
+async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
+    """List of ledger dicts (backward-compatible). Heavy blobs stripped unless full=1."""
+    limit = max(1, min(limit, 500))
+    rows = []
+    for e in store.read()[offset:offset + limit]:
+        if isinstance(e, Evidence) and not full:
+            rows.append(_evidence_summary(e))
+        else:
+            d = to_dict(e)
+            rows.append(d if full else _strip_heavy_fields(d))
+    return rows
 
 
 @app.get("/api/epoch")
@@ -1553,6 +2205,582 @@ async def sse_stream(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ===========================================================================
+# §9b. EVIDENCE HTML — pure indexes/details (no JSON evidence APIs)
+# ===========================================================================
+
+def _a(href: str, label: str) -> list:
+    return ["a", {"href": href}, label]
+
+
+def _pre_blob(text: str) -> list:
+    return ["pre.blob", text if text else "(empty)"]
+
+
+def _evidence_page(title: str, body: list) -> HTMLResponse:
+    return HTMLResponse(render(["html",
+        ["head",
+            ["meta", {"charset": "utf-8"}],
+            ["meta", {"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+            ["title", title],
+            ["style", RawContent(_WATCH_CSS)],
+        ],
+        ["body.evidence-doc",
+            ["main", body],
+            ["script", RawContent(_FORM_INTERCEPT_JS)],
+        ],
+    ]))
+
+
+def _evidence_nav(*extra: list) -> list:
+    crumbs = [
+        _a("/", "constitution"), " · ",
+        _a("/epochs", "epochs"), " · ",
+        _a("/watch", "watch"),
+    ]
+    for item in extra:
+        crumbs.extend([" · ", item])
+    return ["p.note", *crumbs]
+
+
+def _dl_rows(rows: list[tuple[str, object]]) -> list:
+    items = []
+    for key, value in rows:
+        if value is None or value == "":
+            continue
+        items.append(["div.kv",
+            ["span.k", key],
+            ["span.v", value if isinstance(value, list) else str(value)],
+        ])
+    return ["div.kv-list", *items] if items else ["p.note", "(none)"]
+
+
+def _link_list(pairs: list[tuple[str, str]]) -> list:
+    if not pairs:
+        return ["p.note", "(none)"]
+    out: list = ["ul"]
+    for label, href in pairs:
+        out.append(["li", _a(href, label)])
+    return out
+
+
+@app.get("/epochs")
+async def epochs_index():
+    epochs = _epochs_in_ledger()
+    rows = []
+    for epoch in epochs:
+        discovery = _discovery_for_epoch(epoch)
+        emission = _emission_for_epoch(epoch)
+        evidence_n = sum(
+            1 for e in evidence_by_kind() if e.epoch == epoch
+        )
+        detail = []
+        if discovery:
+            detail.append(
+                f"{len(discovery.commits)} eligible / "
+                f"{len(discovery.observations)} observed"
+            )
+        if emission:
+            detail.append(f"emitted {emission.total_emitted}")
+        if evidence_n:
+            detail.append(f"{evidence_n} evidence events")
+        elif discovery or emission:
+            detail.append("legacy (no Evidence envelopes)")
+        rows.append(["li",
+            _a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}"),
+            " — ",
+            ", ".join(detail) if detail else "recorded",
+        ])
+    return _evidence_page("epochs", [
+        _evidence_nav(),
+        ["div.eyebrow", "transparent constitutional evidence"],
+        ["h1", "epochs"],
+        ["p", "Each epoch indexes discovery, commits, comparisons, judgments, ranking, and emission."],
+        ["ul", *rows] if rows else ["p.note", "No epochs in the ledger yet."],
+    ])
+
+
+@app.get("/epochs/{epoch}")
+async def epoch_detail(epoch: int):
+    discovery = _discovery_for_epoch(epoch)
+    emission = _emission_for_epoch(epoch)
+    evidence_rows = [e for e in evidence_by_kind() if e.epoch == epoch]
+    commit_evs = [e for e in evidence_rows if e.kind == "git.commit"]
+    comparison_evs = [e for e in evidence_rows if e.kind == "comparison.input"]
+    judgment_evs = [e for e in evidence_rows if e.kind == "llm.judgment"]
+    ranking_started = next(
+        (e for e in evidence_rows if e.kind == "ranking.started"), None
+    )
+    ranking_completed = next(
+        (e for e in evidence_rows if e.kind == "ranking.completed"), None
+    )
+    legacy = not evidence_rows and (discovery is not None or emission is not None)
+
+    commit_links: list[tuple[str, str]] = []
+    if commit_evs:
+        for e in commit_evs:
+            cid = e.payload.get("commit_id") or ""
+            label = (
+                f"{e.payload.get('oid', cid)[:24]} "
+                f"({e.payload.get('contributor', '?')})"
+            )
+            commit_links.append((label, _evidence_path("commit", cid)))
+    elif discovery:
+        for c in discovery.commits:
+            cid = commit_id_for_oid(c["oid"])
+            commit_links.append((
+                f"{c['oid'][:24]} ({c.get('contributor', '?')})",
+                _evidence_path("commit", cid),
+            ))
+
+    comparison_links = [
+        (
+            e.payload.get("summary") or e.payload.get("comparison_id", e.event_id),
+            _evidence_path("comparison", e.payload["comparison_id"]),
+        )
+        for e in comparison_evs
+        if e.payload.get("comparison_id")
+    ]
+    judgment_links = [
+        (
+            e.payload.get("summary") or e.payload.get("judgment_id", e.event_id),
+            _evidence_path("judgment", e.payload["judgment_id"]),
+        )
+        for e in judgment_evs
+        if e.payload.get("judgment_id")
+    ]
+    event_links = [
+        (f"{e.kind} · {e.event_id[:28]}", _evidence_path("event", e.event_id))
+        for e in evidence_rows
+    ]
+
+    excluded = []
+    if discovery:
+        for obs in discovery.observations:
+            if obs.get("eligible"):
+                continue
+            oid = obs.get("oid", "?")
+            reason = obs.get("exclusion_reason") or "excluded"
+            excluded.append(["li",
+                f"{oid[:28]} — {reason} — ",
+                ["span.note", "legacy evidence unavailable"],
+            ])
+
+    ranking_nodes: list = []
+    if ranking_completed:
+        ranking_nodes = [
+            ["p", ranking_completed.payload.get("summary") or "ranking completed"],
+            _dl_rows([
+                ("ranking_run_id", ranking_completed.payload.get("ranking_run_id")),
+                ("models", ", ".join(ranking_completed.payload.get("models") or [])),
+                ("event", _a(
+                    _evidence_path("event", ranking_completed.event_id),
+                    ranking_completed.event_id,
+                )),
+            ]),
+            ["pre.blob", json.dumps(
+                ranking_completed.payload.get("ranking") or {},
+                indent=2, sort_keys=True,
+            )],
+        ]
+    elif emission:
+        if legacy and len(emission.ranking or {}) <= 1:
+            ranking_nodes.append(["p.note",
+                "Single-contributor epoch — no LLM judgments."
+            ])
+        ranking_nodes.extend([
+            ["p", "Projected from Emission (no ranking Evidence event)."],
+            ["pre.blob", json.dumps(emission.ranking, indent=2, sort_keys=True)],
+        ])
+    else:
+        ranking_nodes = [["p.note", "No ranking recorded."]]
+    if ranking_started and not ranking_completed:
+        ranking_nodes.insert(0, ["p.note",
+            f"Ranking started: {ranking_started.event_id}"
+        ])
+
+    if emission:
+        emission_node = _dl_rows([
+            ("total_emitted", emission.total_emitted),
+            ("pool_before", emission.pool_before),
+            ("pool_after", emission.pool_after),
+            ("discovery_snapshot_id", emission.discovery_snapshot_id),
+            ("ranking_run_id", emission.ranking_run_id or None),
+            ("models_used", ", ".join(emission.models_used or [])),
+            ("distributions", json.dumps(emission.distributions, sort_keys=True)),
+        ])
+    else:
+        emission_node = ["p.note", "No emission for this epoch."]
+
+    single_contributor = False
+    if discovery:
+        single_contributor = len({c.get("contributor") for c in discovery.commits}) <= 1
+    elif emission:
+        single_contributor = len(emission.ranking or {}) <= 1
+
+    body = [
+        _evidence_nav(),
+        ["div.eyebrow", f"epoch {epoch}"],
+        ["h1", f"epoch {epoch}"],
+    ]
+    if legacy:
+        body.append(["p.note",
+            "Legacy epoch: projected from GitDiscovery/Emission without Evidence "
+            "envelopes. Eligible commits use discovery patches; discarded observation "
+            "metadata is marked legacy evidence unavailable. Single-contributor "
+            "epochs have no LLM judgments."
+        ])
+    if discovery:
+        body.extend([
+            ["h2", "discovery"],
+            _dl_rows([
+                ("snapshot_id", discovery.snapshot_id),
+                ("config_digest", discovery.config_digest),
+                ("initial_snapshot", discovery.initial_snapshot),
+                ("observations", len(discovery.observations)),
+                ("eligible", len(discovery.commits)),
+            ]),
+        ])
+    no_comparisons_note = "No comparisons."
+    if single_contributor:
+        no_comparisons_note += " Single-contributor — no LLM judgments."
+    body.extend([
+        ["h2", "commits"],
+        _link_list(commit_links),
+        ["h2", "excluded observations"],
+        ["ul", *excluded] if excluded else ["p.note", "(none)"],
+        ["h2", "comparisons"],
+        _link_list(comparison_links) if comparison_links else ["p.note", no_comparisons_note],
+        ["h2", "judgments"],
+        _link_list(judgment_links) if judgment_links else ["p.note", "No judgments recorded."],
+        ["h2", "ranking"],
+        *ranking_nodes,
+        ["h2", "emission"],
+        emission_node,
+        ["h2", "evidence events"],
+        _link_list(event_links) if event_links else ["p.note", "(none)"],
+    ])
+    return _evidence_page(f"epoch {epoch}", body)
+
+
+@app.get("/commits/{commit_id}")
+async def commit_detail(commit_id: str):
+    ev = find_evidence_payload("git.commit", "commit_id", commit_id)
+    discovery, legacy_row = (None, None)
+    if not ev:
+        discovery, legacy_row = _legacy_commit_row(commit_id)
+    if not ev and not legacy_row:
+        discovery, obs = _legacy_observation(commit_id)
+        if obs is not None:
+            epoch = discovery.epoch if discovery else "?"
+            return _evidence_page(f"commit {commit_id[:24]}", [
+                _evidence_nav(
+                    _a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")
+                ),
+                ["div.eyebrow", "commit"],
+                ["h1", commit_id],
+                ["p.note", "legacy evidence unavailable"],
+                _dl_rows([
+                    ("oid", obs.get("oid")),
+                    ("eligible", obs.get("eligible")),
+                    ("exclusion_reason", obs.get("exclusion_reason")),
+                    ("epoch", str(epoch)),
+                ]),
+            ])
+        return _evidence_page("commit not found", [
+            _evidence_nav(),
+            ["h1", "commit not found"],
+            ["p", commit_id],
+        ])
+    if ev:
+        p = ev.payload
+        epoch = ev.epoch
+        oid = p.get("oid", "")
+        contributor = p.get("contributor", "")
+        message = _blob_text(p.get("message"))
+        patch = _blob_text(p.get("patch"))
+        meta = _dl_rows([
+            ("commit_id", commit_id),
+            ("oid", oid),
+            ("contributor", contributor),
+            ("patch_sha256", p.get("patch_sha256")),
+            ("patch_identity", p.get("patch_identity")),
+            ("committer_timestamp_ms", p.get("committer_timestamp_ms")),
+            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
+            ("epoch", _a(_evidence_path("epoch", str(epoch)), str(epoch))),
+        ])
+        legacy_note = None
+    else:
+        assert legacy_row is not None and discovery is not None
+        epoch = discovery.epoch
+        oid = legacy_row.get("oid", "")
+        contributor = legacy_row.get("contributor", "")
+        message = legacy_row.get("message") or ""
+        patch = legacy_row.get("patch") or ""
+        meta = _dl_rows([
+            ("commit_id", commit_id),
+            ("oid", oid),
+            ("contributor", contributor),
+            ("patch_sha256", legacy_row.get("patch_sha256")),
+            ("patch_identity", legacy_row.get("patch_identity")),
+            ("committer_timestamp_ms", legacy_row.get("committer_timestamp_ms")),
+            ("epoch", _a(_evidence_path("epoch", str(epoch)), str(epoch))),
+            ("source", "legacy GitDiscovery projection"),
+        ])
+        legacy_note = ["p.note", "Projected from GitDiscovery — Evidence envelope absent."]
+    return _evidence_page(f"commit {commit_id[:24]}", [
+        _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),
+        ["div.eyebrow", "commit"],
+        ["h1", commit_id],
+        *([legacy_note] if legacy_note else []),
+        meta,
+        ["p", _a(f"/commits/{commit_id}/patch", "download patch")],
+        ["h2", "message"],
+        _pre_blob(message),
+        ["h2", "patch"],
+        _pre_blob(patch),
+    ])
+
+
+@app.get("/commits/{commit_id}/patch")
+async def commit_patch_download(commit_id: str):
+    ev = find_evidence_payload("git.commit", "commit_id", commit_id)
+    if ev:
+        raw = _decode_blob(ev.payload.get("patch")) or _blob_text(ev.payload.get("patch")).encode()
+    else:
+        _, row = _legacy_commit_row(commit_id)
+        if not row:
+            return PlainTextResponse("not found", status_code=404)
+        raw = (row.get("patch") or "").encode("utf-8")
+    return Response(
+        content=raw,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{commit_id}.patch"'
+        },
+    )
+
+
+@app.get("/comparisons/{comparison_id}")
+async def comparison_detail(comparison_id: str):
+    ev = find_evidence_payload("comparison.input", "comparison_id", comparison_id)
+    if not ev:
+        return _evidence_page("comparison not found", [
+            _evidence_nav(),
+            ["h1", "comparison not found"],
+            ["p", comparison_id],
+        ])
+    p = ev.payload
+    side_a = p.get("side_a") or {}
+    side_b = p.get("side_b") or {}
+    attempt_links = []
+    for a in evidence_by_kind("llm.attempt_started"):
+        if a.payload.get("comparison_id") == comparison_id:
+            aid = a.payload.get("attempt_id")
+            if aid:
+                attempt_links.append((
+                    f"{a.payload.get('model_id')} #{a.payload.get('attempt_number')}",
+                    _evidence_path("attempt", aid),
+                ))
+    judgment_links = []
+    for j in evidence_by_kind("llm.judgment"):
+        if j.payload.get("comparison_id") == comparison_id:
+            jid = j.payload.get("judgment_id")
+            if jid:
+                judgment_links.append((
+                    j.payload.get("summary") or jid,
+                    _evidence_path("judgment", jid),
+                ))
+    commit_links = []
+    for cid in (side_a.get("commit_ids") or []) + (side_b.get("commit_ids") or []):
+        commit_links.append((cid, _evidence_path("commit", cid)))
+    return _evidence_page(f"comparison {comparison_id[:24]}", [
+        _evidence_nav(_a(_evidence_path("epoch", str(ev.epoch)), f"epoch {ev.epoch}")),
+        ["div.eyebrow", "comparison"],
+        ["h1", comparison_id],
+        _dl_rows([
+            ("summary", p.get("summary")),
+            ("ranking_run_id", p.get("ranking_run_id")),
+            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
+            ("side_a", side_a.get("contributor")),
+            ("side_b", side_b.get("contributor")),
+        ]),
+        ["p", _a(f"/comparisons/{comparison_id}/prompt", "download prompt")],
+        ["h2", "commits"],
+        _link_list(commit_links),
+        ["h2", "attempts"],
+        _link_list(attempt_links),
+        ["h2", "judgments"],
+        _link_list(judgment_links),
+        ["h2", "prompt"],
+        _pre_blob(_blob_text(p.get("prompt"))),
+        ["h2", f"side A — {side_a.get('contributor', '?')}"],
+        ["h3", "message"],
+        _pre_blob(_blob_text(side_a.get("message"))),
+        ["h3", "diff"],
+        _pre_blob(_blob_text(side_a.get("diff"))),
+        ["h2", f"side B — {side_b.get('contributor', '?')}"],
+        ["h3", "message"],
+        _pre_blob(_blob_text(side_b.get("message"))),
+        ["h3", "diff"],
+        _pre_blob(_blob_text(side_b.get("diff"))),
+    ])
+
+
+@app.get("/comparisons/{comparison_id}/prompt")
+async def comparison_prompt_download(comparison_id: str):
+    ev = find_evidence_payload("comparison.input", "comparison_id", comparison_id)
+    if not ev:
+        return PlainTextResponse("not found", status_code=404)
+    raw = _decode_blob(ev.payload.get("prompt")) or _blob_text(ev.payload.get("prompt")).encode()
+    return Response(
+        content=raw,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{comparison_id}.prompt.txt"'
+        },
+    )
+
+
+@app.get("/attempts/{attempt_id}")
+async def attempt_detail(attempt_id: str):
+    started = find_evidence_payload("llm.attempt_started", "attempt_id", attempt_id)
+    finished = find_evidence_payload("llm.attempt_finished", "attempt_id", attempt_id)
+    if not started and not finished:
+        return _evidence_page("attempt not found", [
+            _evidence_nav(),
+            ["h1", "attempt not found"],
+            ["p", attempt_id],
+        ])
+    base = started or finished
+    assert base is not None
+    p = {**(started.payload if started else {}), **(finished.payload if finished else {})}
+    judgment = None
+    for j in evidence_by_kind("llm.judgment"):
+        if j.payload.get("attempt_id") == attempt_id:
+            judgment = j
+            break
+    comparison_id = p.get("comparison_id")
+    return _evidence_page(f"attempt {attempt_id[:24]}", [
+        _evidence_nav(
+            _a(_evidence_path("epoch", str(base.epoch)), f"epoch {base.epoch}"),
+            *(
+                [_a(_evidence_path("comparison", comparison_id), "comparison")]
+                if comparison_id else []
+            ),
+        ),
+        ["div.eyebrow", "llm attempt"],
+        ["h1", attempt_id],
+        _dl_rows([
+            ("model_id", p.get("model_id")),
+            ("attempt_number", p.get("attempt_number")),
+            ("ok", p.get("ok")),
+            ("http_status", p.get("http_status")),
+            ("duration_ms", p.get("duration_ms")),
+            ("error", json.dumps(p["error"]) if p.get("error") else None),
+            ("started_event",
+             _a(_evidence_path("event", started.event_id), started.event_id)
+             if started else None),
+            ("finished_event",
+             _a(_evidence_path("event", finished.event_id), finished.event_id)
+             if finished else None),
+            ("judgment",
+             _a(
+                 _evidence_path("judgment", judgment.payload["judgment_id"]),
+                 judgment.payload["judgment_id"],
+             ) if judgment and judgment.payload.get("judgment_id") else None),
+        ]),
+        ["h2", "request"],
+        _pre_blob(_blob_text(p.get("request"))),
+        ["h2", "response"],
+        _pre_blob(_blob_text(p.get("response"))),
+    ])
+
+
+@app.get("/judgments/{judgment_id}")
+async def judgment_detail(judgment_id: str):
+    ev = find_evidence_payload("llm.judgment", "judgment_id", judgment_id)
+    if not ev:
+        return _evidence_page("judgment not found", [
+            _evidence_nav(),
+            ["h1", "judgment not found"],
+            ["p", judgment_id],
+        ])
+    p = ev.payload
+    return _evidence_page(f"judgment {judgment_id[:24]}", [
+        _evidence_nav(
+            _a(_evidence_path("epoch", str(ev.epoch)), f"epoch {ev.epoch}"),
+            *(
+                [_a(_evidence_path("comparison", p["comparison_id"]), "comparison")]
+                if p.get("comparison_id") else []
+            ),
+            *(
+                [_a(_evidence_path("attempt", p["attempt_id"]), "attempt")]
+                if p.get("attempt_id") else []
+            ),
+        ),
+        ["div.eyebrow", "judgment"],
+        ["h1", judgment_id],
+        _dl_rows([
+            ("model_id", p.get("model_id")),
+            ("winner", p.get("winner")),
+            ("ratio", p.get("ratio")),
+            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
+        ]),
+        ["h2", "explanation"],
+        _pre_blob(p.get("explanation") or ""),
+    ])
+
+
+@app.get("/events/{event_id}")
+async def event_detail(event_id: str):
+    ev = find_evidence(event_id)
+    if not ev:
+        return _evidence_page("event not found", [
+            _evidence_nav(),
+            ["h1", "event not found"],
+            ["p", event_id],
+        ])
+    p = ev.payload
+    related = []
+    for key, kind in (
+        ("commit_id", "commit"),
+        ("comparison_id", "comparison"),
+        ("attempt_id", "attempt"),
+        ("judgment_id", "judgment"),
+    ):
+        if p.get(key):
+            related.append((f"{key}: {p[key]}", _evidence_path(kind, p[key])))
+    related.append((f"epoch {ev.epoch}", _evidence_path("epoch", str(ev.epoch))))
+    display_payload = {}
+    for key, value in p.items():
+        if isinstance(value, dict) and value.get("encoding") == "base64":
+            display_payload[key] = {
+                "sha256": value.get("sha256"),
+                "byte_length": value.get("byte_length"),
+                "text_preview": (_blob_text(value)[:2000]
+                                 + ("…" if value.get("byte_length", 0) > 2000 else "")),
+            }
+        else:
+            display_payload[key] = value
+    return _evidence_page(f"event {event_id[:24]}", [
+        _evidence_nav(_a(_evidence_path("epoch", str(ev.epoch)), f"epoch {ev.epoch}")),
+        ["div.eyebrow", ev.kind],
+        ["h1", event_id],
+        _dl_rows([
+            ("kind", ev.kind),
+            ("epoch", ev.epoch),
+            ("recorded_at_ms", ev.recorded_at_ms),
+            ("previous_event_sha256", ev.previous_event_sha256),
+            ("schema_version", ev.schema_version),
+        ]),
+        ["h2", "links"],
+        _link_list(related),
+        ["h2", "payload"],
+        _pre_blob(json.dumps(display_payload, indent=2, sort_keys=True, default=str)),
+    ])
 
 
 # ===========================================================================
@@ -1765,6 +2993,12 @@ button:disabled { cursor: default; opacity: .4; }
 .event time, .event-kind { color: var(--meta); font-family: var(--font-code); font-size: 10px; }
 .event-kind { text-transform: uppercase; }
 .event-message { color: var(--prose); font-family: var(--font-prose); }
+.event-links {
+  font-family: var(--font-code);
+  font-size: 10px;
+  grid-column: 1 / -1;
+}
+.event-links a { margin-right: 10px; }
 
 code {
   background: var(--g1);
@@ -1776,9 +3010,33 @@ code {
   padding: 1px 4px;
 }
 
+body.evidence-doc { max-width: 840px; }
+.kv-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.kv { display: grid; gap: 8px; grid-template-columns: 140px 1fr; }
+.kv .k { color: var(--meta); font-family: var(--font-code); font-size: 11px; }
+.kv .v { color: var(--prose); word-break: break-word; }
+pre.blob {
+  background: var(--g1);
+  border: var(--bv) solid;
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  color: var(--code-fg);
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 8px 0 16px;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+ul { padding-left: 1.2em; }
+li { margin: 4px 0; }
+
 @media (max-width: 520px) {
   .event { grid-template-columns: 72px 1fr; }
   .event-message { grid-column: 1 / -1; }
+  .kv { grid-template-columns: 1fr; }
 }
 """
 
@@ -1796,6 +3054,8 @@ def _watch_initial_state() -> dict:
                     f"Epoch {event_.epoch}: observed {len(event_.observations)} commits; "
                     f"{len(event_.commits)} eligible"
                 ),
+                "evidence_url": _evidence_path("epoch", str(event_.epoch)),
+                "links": {"epoch": _evidence_path("epoch", str(event_.epoch))},
             })
         elif isinstance(event_, Emission):
             feed.append({
@@ -1806,6 +3066,17 @@ def _watch_initial_state() -> dict:
                     f"Epoch {event_.epoch}: emitted {event_.total_emitted} SLG; "
                     f"ranking {event_.ranking}"
                 ),
+                "evidence_url": _evidence_path("epoch", str(event_.epoch)),
+                "links": {"epoch": _evidence_path("epoch", str(event_.epoch))},
+            })
+        elif isinstance(event_, Evidence):
+            feed.append({
+                "id": event_.event_id,
+                "timestamp_ms": event_.recorded_at_ms,
+                "kind": event_.kind,
+                "message": event_.payload.get("summary") or event_.kind,
+                "evidence_url": _evidence_path("event", event_.event_id),
+                "links": {"epoch": _evidence_path("epoch", str(event_.epoch))},
             })
     feed.extend(AUDIT_HISTORY)
     return {
@@ -1852,6 +3123,25 @@ function addEvent(event) {
   message.className = 'event-message';
   message.textContent = event.message;
   row.append(when, kind, message);
+  const linkPairs = [];
+  if (event.evidence_url) linkPairs.push(['evidence', event.evidence_url]);
+  if (event.links && typeof event.links === 'object') {
+    for (const [label, href] of Object.entries(event.links)) {
+      if (href) linkPairs.push([label, href]);
+    }
+  }
+  if (linkPairs.length) {
+    const links = document.createElement('span');
+    links.className = 'event-links';
+    for (const [label, href] of linkPairs) {
+      const a = document.createElement('a');
+      a.href = href;
+      a.textContent = label;
+      links.appendChild(a);
+      links.appendChild(document.createTextNode(' '));
+    }
+    row.appendChild(links);
+  }
   feed.prepend(row);
   while (feed.children.length > 200) feed.lastElementChild.remove();
 }
@@ -1957,6 +3247,7 @@ async def watch():
                 ["div#audit-feed"],
             ],
             ["p", ["a", {"href": "/"}, "← constitution"], " · ",
+                  ["a", {"href": "/epochs"}, "epochs"], " · ",
                   ["a", {"href": "/api/status"}, "status JSON"], " · ",
                   ["a", {"href": "/api/ledger"}, "ledger"]],
         ]],
@@ -1984,6 +3275,7 @@ async def index(request: Request):
             ["p", ["a", {"href": "/login"}, "Login with GitHub to check your emissions"]],
             ["p",
                 ["a", {"href": "/watch"}, "Watch emission process live"], " | ",
+                ["a", {"href": "/epochs"}, "Epoch evidence"], " | ",
                 ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
                 ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
                 ["a", {"href": "/api/halvening"}, "Jubilee countdown"],
@@ -2010,6 +3302,7 @@ async def index(request: Request):
         redeem_form,
         ["p",
             ["a", {"href": "/api/epoch"}, "Current epoch"], " | ",
+            ["a", {"href": "/epochs"}, "Epoch evidence"], " | ",
             ["a", {"href": "/api/ledger"}, "Full ledger"], " | ",
             ["a", {"href": "/watch"}, "Watch emission live"],
         ],
