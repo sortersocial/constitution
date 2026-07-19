@@ -503,9 +503,18 @@ def _epochs_in_ledger() -> list[int]:
 
 
 def build_pairwise_prompt(side_a: dict, side_b: dict) -> str:
-    return f"""You are ranking individual git commits to an open source project.
-Compare these two commits. Decide which commit contributed more.
+    return f"""You are a constitutional council ranking individual git commits for ownership allocation.
+
+Compare these two commits. Decide which contributed more lasting value to the project.
+
+Judge substance, not spectacle:
+- Prefer correct, lasting design and real bugfixes over churn, formatting, renames, or generated noise.
+- Prefer clarity and necessity over sheer line count. A small precise change can beat a large diffuse one.
+- Do not favor a side merely because its patch is longer or noisier.
+- Weight what the change does for the project, not the contributor's name.
+
 Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
+The explanation must cite concrete differences in the patches (1-3 sentences).
 
 Side A — contributor: {side_a.get('contributor', '?')}
 Side A — commit message:
@@ -801,9 +810,14 @@ async def _fetch_models_from_slug_rank_parent(
     return out
 
 
+def _model_provider(model_id: str) -> str:
+    return (model_id or "").split("/", 1)[0] or model_id
+
+
 async def _fetch_models_openrouter_only(
     client: httpx.AsyncClient, n: int, exclude: set[str]
 ) -> list[str]:
+    """Top up council seats, preferring provider diversity over same-lab clones."""
     key = (OPENROUTER_API_KEY or "").strip()
     if not key or n <= 0:
         return []
@@ -815,10 +829,24 @@ async def _fetch_models_openrouter_only(
     models = resp.json()["data"]
     chat_models = [m for m in models if "chat" in m.get("id", "")]
     chat_models.sort(key=lambda m: m.get("created", 0), reverse=True)
-    out = []
+    out: list[str] = []
+    used_providers = {_model_provider(m) for m in exclude}
+    # Pass 1: one seat per unused provider.
     for m in chat_models:
         mid = m["id"]
-        if mid in exclude:
+        if mid in exclude or mid in out:
+            continue
+        provider = _model_provider(mid)
+        if provider in used_providers:
+            continue
+        out.append(mid)
+        used_providers.add(provider)
+        if len(out) >= n:
+            return out
+    # Pass 2: fill remaining seats with newest chat models.
+    for m in chat_models:
+        mid = m["id"]
+        if mid in exclude or mid in out:
             continue
         out.append(mid)
         if len(out) >= n:
@@ -1639,6 +1667,10 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
 
     sides = [_commit_side_for_llm(row) for row in ordered]
     judgment_ids: list[str] = []
+    # A dead juror must not halt the court. Retire after hard failure; continue
+    # with remaining models. Abort only when a comparison gets zero votes.
+    retired_models: set[str] = set()
+    models_that_voted: set[str] = set()
 
     async def compare_fn(i, j):
         side_a, side_b = sides[i], sides[j]
@@ -1690,6 +1722,8 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         ]))
         results = []
         for model in models:
+            if model in retired_models:
+                continue
             try:
                 existing = _find_judgment(comparison_id, model)
                 if existing:
@@ -1715,6 +1749,7 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                 ratio = result["ratio"].split(":")
                 winner_weight, loser_weight = float(ratio[0]), float(ratio[1])
                 results.append((w, l, winner_weight, loser_weight))
+                models_that_voted.add(model)
                 jud_id = (existing or _find_judgment(comparison_id, model) or {}).get(
                     "judgment_id"
                 )
@@ -1747,15 +1782,31 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                     ]
                 ]))
             except Exception as e:
+                retired_models.add(model)
+                await append_evidence(epoch, "llm.council_member_failed", {
+                    "ranking_run_id": ranking_run_id,
+                    "comparison_id": comparison_id,
+                    "model_id": model,
+                    "error": {"type": type(e).__name__, "message": str(e)},
+                    "summary": (
+                        f"Retired {model} from this ranking run after hard failure"
+                    ),
+                })
                 await broadcast_audit(
                     "error",
-                    f"{model} failed: {e}",
-                    phase="error",
+                    f"{model} failed and was retired from this run: {e}",
+                    phase="ranking",
+                    evidence_url=_evidence_url("comparison", comparison_id),
+                    links={"comparison": _evidence_url("comparison", comparison_id)},
                 )
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
-                    ["div.log-error", f"⚠ {model}: {e}"]
+                    ["div.log-error",
+                        f"⚠ {model} retired after failure: {e}"]
                 ]))
-                raise RuntimeError(f"council model failed: {model}") from e
+        if not results:
+            raise RuntimeError(
+                f"council model failed: no votes for comparison {comparison_id}"
+            )
         return results
 
     async def progress_fn(ev):
@@ -1793,9 +1844,12 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         key=lambda x: x[1],
         reverse=True,
     )
+    models_voted = sorted(models_that_voted) or list(models)
     completed = await append_evidence(epoch, "ranking.completed", {
         "ranking_run_id": ranking_run_id,
         "models": models,
+        "models_voted": models_voted,
+        "models_failed": sorted(retired_models),
         "commit_ranking": commit_ranking,
         "contributor_ranking": {a: str(s) for a, s in contrib_rows},
         "ranking": {a: str(s) for a, s in contrib_rows},
@@ -1806,6 +1860,10 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                 f"{cid[:16]}={float(s):.4f}" for cid, s, _ in commit_rows[:12]
             )
             + ("…" if len(commit_rows) > 12 else "")
+            + (
+                f" (retired: {', '.join(sorted(retired_models))})"
+                if retired_models else ""
+            )
         ),
     })
     await broadcast_audit(
@@ -1824,7 +1882,7 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in contrib_rows],
         ]
     ]))
-    return contributor_totals, models, {
+    return contributor_totals, models_voted, {
         "ranking_run_id": ranking_run_id,
         "ranking_event_id": completed.event_id,
     }
@@ -2413,6 +2471,7 @@ async def epoch_detail(epoch: int):
 
     # Dense comparison cards with inline reasoning (permalinks kept).
     comparison_cards: list = []
+    disagreement_cards: list = []
     for cmp in comparison_evs:
         cid = cmp.payload.get("comparison_id")
         if not cid:
@@ -2421,8 +2480,11 @@ async def epoch_detail(epoch: int):
         side_b = cmp.payload.get("side_b") or {}
         juds = _judgments_for_comparison(cid)
         reason_lines = []
+        winners: set[str] = set()
         for j in juds:
             p = j.payload
+            if p.get("winner"):
+                winners.add(str(p["winner"]))
             expl = (p.get("explanation") or "").strip()
             if len(expl) > 220:
                 expl = expl[:220] + "…"
@@ -2431,16 +2493,21 @@ async def epoch_detail(epoch: int):
                 f" → {p.get('winner')} ({p.get('ratio')}) — {expl} ",
                 _a(_evidence_path("judgment", p.get("judgment_id") or j.event_id), "↗"),
             ])
-        comparison_cards.append(["article.dense-card",
+        card = ["article.dense-card",
             ["div.card-head",
                 _a(_evidence_path("comparison", cid), "comparison"),
                 " · ",
                 _side_label(side_a),
                 " vs ",
                 _side_label(side_b),
+                *([" · ", ["span.disagree", "disagreement"]]
+                  if len(winners) > 1 else []),
             ],
             ["ul.reason-list", *reason_lines] if reason_lines else ["p.note", "No judgments yet."],
-        ])
+        ]
+        comparison_cards.append(card)
+        if len(winners) > 1:
+            disagreement_cards.append(card)
 
     ranking_nodes: list = []
     if ranking_completed:
@@ -2468,9 +2535,14 @@ async def epoch_detail(epoch: int):
                 ["td", who or "?"],
                 ["td.msg", msg],
             ])
+        models_failed = ranking_completed.payload.get("models_failed") or []
         ranking_nodes = [
             ["p.note", ranking_completed.payload.get("summary") or "ranking completed"],
             ["p", "Models: ", ", ".join(ranking_completed.payload.get("models") or []) or "—"],
+            *(
+                [["p.note", "Retired mid-run: ", ", ".join(models_failed)]]
+                if models_failed else []
+            ),
             ["h3", "commit ranking"],
             ["table.dense",
                 ["thead", ["tr",
@@ -2559,6 +2631,12 @@ async def epoch_detail(epoch: int):
         emission_node,
         ["h2", "ranking"],
         *ranking_nodes,
+        ["h2", "council disagreements"],
+        *(
+            disagreement_cards
+            if disagreement_cards
+            else [["p.note", "No split votes yet — council unanimous where judged."]]
+        ),
         ["h2", "comparisons"],
         *(comparison_cards if comparison_cards else [["p.note", no_comparisons_note]]),
         _fold("All commits", _link_list(commit_links)),
@@ -3147,6 +3225,7 @@ p.lede { color: var(--ui); margin: 0 0 1em; }
 .card-head { color: var(--ui); font-family: var(--font-code); font-size: 12px; margin-bottom: 6px; }
 .reason-list { margin: 0; padding-left: 1.1em; }
 .reason-list li { color: var(--prose); font-family: var(--font-prose); line-height: 1.45; }
+.disagree { color: #c9a227; font-family: var(--font-code); font-size: 12px; }
 .judgment {
   background: var(--g1);
   border-left: 3px solid var(--link);

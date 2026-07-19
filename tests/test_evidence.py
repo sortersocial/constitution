@@ -92,6 +92,40 @@ def test_commit_without_evidence_is_not_found(evidence_store):
     assert "legacy" not in html.lower()
 
 
+def test_pairwise_prompt_rejects_patch_theater():
+    prompt = c.build_pairwise_prompt(
+        {"contributor": "a", "message": "m", "diff": "d"},
+        {"contributor": "b", "message": "m", "diff": "d"},
+    )
+    assert "lasting value" in prompt
+    assert "line count" in prompt
+
+
+def test_epoch_page_surfaces_council_disagreements(evidence_store):
+    cmp_id = "cmp_disagree"
+    asyncio.run(c.append_evidence(2, "comparison.input", {
+        "comparison_id": cmp_id,
+        "summary": "A vs B",
+        "side_a": {"commit_id": "c_a", "contributor": "alice"},
+        "side_b": {"commit_id": "c_b", "contributor": "bob"},
+        "prompt": c._bytes_blob("p"),
+    }))
+    for model, winner in (("mock/a", "A"), ("mock/b", "B")):
+        asyncio.run(c.append_evidence(2, "llm.judgment", {
+            "judgment_id": f"jud_{model}",
+            "comparison_id": cmp_id,
+            "model_id": model,
+            "winner": winner,
+            "ratio": "2:1",
+            "explanation": f"{model} picked {winner}",
+            "summary": f"{model}: {winner}",
+        }))
+    html = asyncio.run(c.epoch_detail(2)).body.decode()
+    assert "council disagreements" in html
+    assert "disagreement" in html
+    assert f"/comparisons/{cmp_id}" in html
+
+
 def test_comparison_page_shows_reasoning_inline(evidence_store):
     cmp_id = "cmp_test_dense"
     jud_id = "jud_test_dense"

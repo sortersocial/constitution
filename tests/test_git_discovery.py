@@ -513,7 +513,7 @@ def test_same_contributor_multiple_commits_runs_pairwise(
     assert info["ranking_event_id"]
 
 
-def test_any_council_failure_aborts_ranking(discovery_config, monkeypatch):
+def test_all_council_failures_abort_ranking(discovery_config, monkeypatch):
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
 
     async def models(n=3):
@@ -536,6 +536,64 @@ def test_any_council_failure_aborts_ranking(discovery_config, monkeypatch):
     ]
     with pytest.raises(RuntimeError, match="council model failed"):
         asyncio.run(c.rank_commits(commits, epoch=0))
+
+
+def test_one_council_failure_retires_model_and_continues(discovery_config, monkeypatch):
+    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+
+    async def models(n=3):
+        return ["broken", "solid"]
+
+    async def compare(model_id, side_a, side_b, **kwargs):
+        if model_id == "broken":
+            raise RuntimeError("model unavailable")
+        if kwargs.get("persist"):
+            attempt_id = c.attempt_id_for(kwargs["comparison_id"], model_id, 1)
+            await c.append_evidence(kwargs["epoch"], "llm.judgment", {
+                "judgment_id": c.judgment_id_for({
+                    "attempt_id": attempt_id,
+                    "comparison_id": kwargs["comparison_id"],
+                    "model_id": model_id,
+                    "winner": "A",
+                    "ratio": "2:1",
+                    "explanation": "ok",
+                }),
+                "attempt_id": attempt_id,
+                "comparison_id": kwargs["comparison_id"],
+                "model_id": model_id,
+                "winner": "A",
+                "ratio": "2:1",
+                "explanation": "ok",
+                "summary": "ok",
+            })
+        return {"winner": "A", "ratio": "2:1", "explanation": "ok"}
+
+    monkeypatch.setattr(c, "fetch_top_models", models)
+    monkeypatch.setattr(c, "llm_pairwise_compare", compare)
+    monkeypatch.setattr(c, "OPENROUTER_API_KEY", "test-key")
+    commits = [
+        {
+            "contributor": contributor,
+            "oid": "sha1:" + char * 40,
+            "message": contributor,
+            "patch": "patch",
+        }
+        for contributor, char in [("alice", "a"), ("bob", "b")]
+    ]
+    ranking, used, _info = asyncio.run(c.rank_commits(commits, epoch=0))
+    assert set(ranking) == {"alice", "bob"}
+    assert used == ["solid"]
+    retired = [
+        e for e in c.store.read()
+        if isinstance(e, c.Evidence) and e.kind == "llm.council_member_failed"
+    ]
+    assert len(retired) == 1
+    assert retired[0].payload["model_id"] == "broken"
+    completed = next(
+        e for e in c.store.read()
+        if isinstance(e, c.Evidence) and e.kind == "ranking.completed"
+    )
+    assert completed.payload["models_failed"] == ["broken"]
 
 
 def test_multi_commit_ranking_requires_openrouter_key(monkeypatch):
