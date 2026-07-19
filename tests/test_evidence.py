@@ -92,6 +92,43 @@ def test_commit_without_evidence_is_not_found(evidence_store):
     assert "legacy" not in html.lower()
 
 
+def test_comparison_page_shows_reasoning_inline(evidence_store):
+    cmp_id = "cmp_test_dense"
+    jud_id = "jud_test_dense"
+    asyncio.run(c.append_evidence(1, "comparison.input", {
+        "comparison_id": cmp_id,
+        "summary": "A vs B",
+        "side_a": {
+            "commit_id": "c_aaa",
+            "contributor": "alice",
+            "message": c._bytes_blob("msg a"),
+            "diff": c._bytes_blob("diff a"),
+        },
+        "side_b": {
+            "commit_id": "c_bbb",
+            "contributor": "bob",
+            "message": c._bytes_blob("msg b"),
+            "diff": c._bytes_blob("diff b"),
+        },
+        "prompt": c._bytes_blob("prompt"),
+    }))
+    asyncio.run(c.append_evidence(1, "llm.judgment", {
+        "judgment_id": jud_id,
+        "comparison_id": cmp_id,
+        "model_id": "mock/model",
+        "winner": "A",
+        "ratio": "3:1",
+        "explanation": "Side A clearly did more substantive work.",
+        "summary": "mock: A",
+    }))
+    html = asyncio.run(c.comparison_detail(cmp_id)).body.decode()
+    assert "council reasoning" in html
+    assert "Side A clearly did more substantive work." in html
+    assert "mock/model" in html
+    assert f"/judgments/{jud_id}" in html
+
+
+
 def test_ranking_resume_skips_duplicate_provider_calls(evidence_store, monkeypatch):
     calls = {"n": 0}
 

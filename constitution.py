@@ -2247,8 +2247,53 @@ def _a(href: str, label: str) -> list:
     return ["a", {"href": href}, label]
 
 
-def _pre_blob(text: str) -> list:
-    return ["pre.blob", text if text else "(empty)"]
+def _pre_blob(text: str, *, cls: str = "blob") -> list:
+    return [f"pre.{cls}", text if text else "(empty)"]
+
+
+def _fold(summary: str, *body) -> list:
+    return ["details.fold", ["summary", summary], *body]
+
+
+def _short_id(value: str | None, n: int = 12) -> str:
+    if not value:
+        return "?"
+    return value if len(value) <= n else value[:n]
+
+
+def _side_label(side: dict) -> str:
+    cid = side.get("commit_id") or (side.get("commit_ids") or ["?"])[0]
+    who = side.get("contributor") or "?"
+    return f"{_short_id(cid, 14)} ({who})"
+
+
+def _judgments_for_comparison(comparison_id: str) -> list[Evidence]:
+    return [
+        e for e in evidence_by_kind("llm.judgment")
+        if e.payload.get("comparison_id") == comparison_id
+    ]
+
+
+def _judgment_blocks(judgments: list[Evidence]) -> list:
+    if not judgments:
+        return [["p.note", "No judgments yet."]]
+    blocks: list = []
+    for j in judgments:
+        p = j.payload
+        jid = p.get("judgment_id") or j.event_id
+        blocks.append(["article.judgment",
+            ["div.judgment-meta",
+                ["strong", p.get("model_id") or "?"],
+                " · winner ",
+                ["span.winner", str(p.get("winner") or "?")],
+                " · ",
+                ["span.ratio", str(p.get("ratio") or "?")],
+                " · ",
+                _a(_evidence_path("judgment", jid), "permalink"),
+            ],
+            ["p.explanation", p.get("explanation") or "(no explanation)"],
+        ])
+    return blocks
 
 
 def _evidence_page(title: str, body: list) -> HTMLResponse:
@@ -2360,6 +2405,119 @@ async def epoch_detail(epoch: int):
         (e for e in evidence_rows if e.kind == "ranking.completed"), None
     )
 
+    commit_by_id = {
+        e.payload["commit_id"]: e
+        for e in commit_evs
+        if e.payload.get("commit_id")
+    }
+
+    # Dense comparison cards with inline reasoning (permalinks kept).
+    comparison_cards: list = []
+    for cmp in comparison_evs:
+        cid = cmp.payload.get("comparison_id")
+        if not cid:
+            continue
+        side_a = cmp.payload.get("side_a") or {}
+        side_b = cmp.payload.get("side_b") or {}
+        juds = _judgments_for_comparison(cid)
+        reason_lines = []
+        for j in juds:
+            p = j.payload
+            expl = (p.get("explanation") or "").strip()
+            if len(expl) > 220:
+                expl = expl[:220] + "…"
+            reason_lines.append(["li",
+                ["strong", p.get("model_id") or "?"],
+                f" → {p.get('winner')} ({p.get('ratio')}) — {expl} ",
+                _a(_evidence_path("judgment", p.get("judgment_id") or j.event_id), "↗"),
+            ])
+        comparison_cards.append(["article.dense-card",
+            ["div.card-head",
+                _a(_evidence_path("comparison", cid), "comparison"),
+                " · ",
+                _side_label(side_a),
+                " vs ",
+                _side_label(side_b),
+            ],
+            ["ul.reason-list", *reason_lines] if reason_lines else ["p.note", "No judgments yet."],
+        ])
+
+    ranking_nodes: list = []
+    if ranking_completed:
+        commit_ranking = ranking_completed.payload.get("commit_ranking") or {}
+        contrib_ranking = (
+            ranking_completed.payload.get("contributor_ranking")
+            or ranking_completed.payload.get("ranking")
+            or {}
+        )
+        rank_rows = []
+        for i, (cid, score) in enumerate(sorted(
+            commit_ranking.items(),
+            key=lambda kv: Decimal(str(kv[1])),
+            reverse=True,
+        ), start=1):
+            ev = commit_by_id.get(cid)
+            who = (ev.payload.get("contributor") if ev else "?")
+            msg = ""
+            if ev:
+                msg = _blob_text(ev.payload.get("message")).split("\n", 1)[0][:80]
+            rank_rows.append(["tr",
+                ["td", str(i)],
+                ["td", ["code", f"{float(score):.4f}"]],
+                ["td", _a(_evidence_path("commit", cid), _short_id(cid, 16))],
+                ["td", who or "?"],
+                ["td.msg", msg],
+            ])
+        ranking_nodes = [
+            ["p.note", ranking_completed.payload.get("summary") or "ranking completed"],
+            ["p", "Models: ", ", ".join(ranking_completed.payload.get("models") or []) or "—"],
+            ["h3", "commit ranking"],
+            ["table.dense",
+                ["thead", ["tr",
+                    ["th", "#"], ["th", "score"], ["th", "commit"],
+                    ["th", "author"], ["th", "message"],
+                ]],
+                ["tbody", *rank_rows],
+            ] if rank_rows else ["p.note", "(none)"],
+            ["h3", "contributor rollup"],
+            ["pre.blob.compact", json.dumps(contrib_ranking, indent=2, sort_keys=True)],
+        ]
+    elif ranking_started:
+        ranking_nodes = [["p.note", f"Ranking started: {ranking_started.event_id}"]]
+    else:
+        ranking_nodes = [["p.note", "No ranking evidence."]]
+
+    if emission:
+        emission_node = _dl_rows([
+            ("total_emitted", emission.total_emitted),
+            ("pool", f"{emission.pool_before} → {emission.pool_after}"),
+            ("models_used", ", ".join(emission.models_used or [])),
+            ("distributions", json.dumps(emission.distributions, sort_keys=True)),
+        ])
+    else:
+        emission_node = ["p.note", "No emission for this epoch."]
+
+    excluded = []
+    if discovery_ev:
+        for obs in discovery_ev.payload.get("observations") or []:
+            if obs.get("eligible"):
+                continue
+            excluded.append(["li",
+                f"{(obs.get('oid') or '?')[:28]} — {obs.get('exclusion_reason') or 'excluded'}"
+            ])
+
+    event_links = [
+        (f"{e.kind} · {e.event_id[:28]}", _evidence_path("event", e.event_id))
+        for e in evidence_rows
+    ]
+    judgment_links = [
+        (
+            e.payload.get("summary") or e.payload.get("judgment_id", e.event_id),
+            _evidence_path("judgment", e.payload["judgment_id"]),
+        )
+        for e in judgment_evs
+        if e.payload.get("judgment_id")
+    ]
     commit_links = [
         (
             f"{e.payload.get('oid', e.payload.get('commit_id', ''))[:24]} "
@@ -2377,120 +2535,42 @@ async def epoch_detail(epoch: int):
         for e in comparison_evs
         if e.payload.get("comparison_id")
     ]
-    judgment_links = [
-        (
-            e.payload.get("summary") or e.payload.get("judgment_id", e.event_id),
-            _evidence_path("judgment", e.payload["judgment_id"]),
-        )
-        for e in judgment_evs
-        if e.payload.get("judgment_id")
-    ]
-    event_links = [
-        (f"{e.kind} · {e.event_id[:28]}", _evidence_path("event", e.event_id))
-        for e in evidence_rows
-    ]
-
-    excluded = []
-    if discovery_ev:
-        for obs in discovery_ev.payload.get("observations") or []:
-            if obs.get("eligible"):
-                continue
-            oid = obs.get("oid", "?")
-            reason = obs.get("exclusion_reason") or "excluded"
-            excluded.append(["li", f"{oid[:28]} — {reason}"])
-
-    ranking_nodes: list = []
-    if ranking_completed:
-        commit_ranking = ranking_completed.payload.get("commit_ranking") or {}
-        contrib_ranking = (
-            ranking_completed.payload.get("contributor_ranking")
-            or ranking_completed.payload.get("ranking")
-            or {}
-        )
-        commit_rank_links = [
-            (
-                f"{cid[:20]} = {score}",
-                _evidence_path("commit", cid),
-            )
-            for cid, score in sorted(
-                commit_ranking.items(),
-                key=lambda kv: Decimal(str(kv[1])),
-                reverse=True,
-            )
-        ]
-        ranking_nodes = [
-            ["p", ranking_completed.payload.get("summary") or "ranking completed"],
-            _dl_rows([
-                ("ranking_run_id", ranking_completed.payload.get("ranking_run_id")),
-                ("models", ", ".join(ranking_completed.payload.get("models") or [])),
-                ("event", _a(
-                    _evidence_path("event", ranking_completed.event_id),
-                    ranking_completed.event_id,
-                )),
-            ]),
-            ["h3", "commit ranking"],
-            _link_list(commit_rank_links) if commit_rank_links else ["p.note", "(none)"],
-            ["h3", "contributor rollup"],
-            ["pre.blob", json.dumps(contrib_ranking, indent=2, sort_keys=True)],
-        ]
-    elif ranking_started:
-        ranking_nodes = [["p.note", f"Ranking started: {ranking_started.event_id}"]]
-    else:
-        ranking_nodes = [["p.note", "No ranking evidence."]]
-
-    if emission:
-        emission_node = _dl_rows([
-            ("total_emitted", emission.total_emitted),
-            ("pool_before", emission.pool_before),
-            ("pool_after", emission.pool_after),
-            ("discovery_snapshot_id", emission.discovery_snapshot_id),
-            ("ranking_run_id", emission.ranking_run_id or None),
-            ("ranking_event_id", emission.ranking_event_id or None),
-            ("models_used", ", ".join(emission.models_used or [])),
-            ("distributions", json.dumps(emission.distributions, sort_keys=True)),
-        ])
-    else:
-        emission_node = ["p.note", "No emission for this epoch."]
 
     no_comparisons_note = "No comparisons."
     if len(commit_evs) <= 1:
         no_comparisons_note += " Fewer than two eligible commits — nothing to pairwise-rank."
 
+    disc_line = ""
+    if discovery_ev:
+        disc_line = (
+            f"{discovery_ev.payload.get('eligible_count', 0)} eligible / "
+            f"{discovery_ev.payload.get('observation_count', 0)} observed"
+        )
+
     body = [
         _evidence_nav(),
         ["div.eyebrow", f"epoch {epoch}"],
         ["h1", f"epoch {epoch}"],
-    ]
-    if discovery_ev:
-        body.extend([
-            ["h2", "discovery"],
-            _dl_rows([
-                ("snapshot_id", discovery_ev.payload.get("snapshot_id")),
-                ("config_digest", discovery_ev.payload.get("config_digest")),
-                ("observations", discovery_ev.payload.get("observation_count")),
-                ("eligible", discovery_ev.payload.get("eligible_count")),
-                ("event", _a(
-                    _evidence_path("event", discovery_ev.event_id),
-                    discovery_ev.event_id,
-                )),
-            ]),
-        ])
-    body.extend([
-        ["h2", "commits"],
-        _link_list(commit_links),
-        ["h2", "excluded observations"],
-        ["ul", *excluded] if excluded else ["p.note", "(none)"],
-        ["h2", "comparisons"],
-        _link_list(comparison_links) if comparison_links else ["p.note", no_comparisons_note],
-        ["h2", "judgments"],
-        _link_list(judgment_links) if judgment_links else ["p.note", "No judgments recorded."],
-        ["h2", "ranking"],
-        *ranking_nodes,
+        ["p.lede",
+            disc_line + (" · " if disc_line and emission else ""),
+            (f"emitted {emission.total_emitted}" if emission else ""),
+        ],
         ["h2", "emission"],
         emission_node,
-        ["h2", "evidence events"],
-        _link_list(event_links) if event_links else ["p.note", "(none)"],
-    ])
+        ["h2", "ranking"],
+        *ranking_nodes,
+        ["h2", "comparisons"],
+        *(comparison_cards if comparison_cards else [["p.note", no_comparisons_note]]),
+        _fold("All commits", _link_list(commit_links)),
+        _fold("Excluded observations",
+              ["ul", *excluded] if excluded else ["p.note", "(none)"]),
+        _fold("Judgment permalinks",
+              _link_list(judgment_links) if judgment_links else ["p.note", "(none)"]),
+        _fold("Comparison permalinks",
+              _link_list(comparison_links) if comparison_links else ["p.note", "(none)"]),
+        _fold("Raw evidence events",
+              _link_list(event_links) if event_links else ["p.note", "(none)"]),
+    ]
     return _evidence_page(f"epoch {epoch}", body)
 
 
@@ -2505,25 +2585,52 @@ async def commit_detail(commit_id: str):
         ])
     p = ev.payload
     epoch = ev.epoch
+    related_cmp = []
+    for cmp in evidence_by_kind("comparison.input"):
+        if cmp.epoch != epoch:
+            continue
+        sa, sb = cmp.payload.get("side_a") or {}, cmp.payload.get("side_b") or {}
+        ids = {
+            sa.get("commit_id"),
+            *(sa.get("commit_ids") or []),
+            sb.get("commit_id"),
+            *(sb.get("commit_ids") or []),
+        }
+        if commit_id not in ids:
+            continue
+        cid = cmp.payload.get("comparison_id")
+        if not cid:
+            continue
+        juds = _judgments_for_comparison(cid)
+        related_cmp.append(["article.dense-card",
+            ["div.card-head",
+                _a(_evidence_path("comparison", cid), "comparison"),
+                " · ",
+                _side_label(sa),
+                " vs ",
+                _side_label(sb),
+            ],
+            *_judgment_blocks(juds),
+        ])
     return _evidence_page(f"commit {commit_id[:24]}", [
         _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),
         ["div.eyebrow", "commit"],
-        ["h1", commit_id],
-        _dl_rows([
+        ["h1", _short_id(commit_id, 20)],
+        ["p.lede", p.get("contributor") or "?", " · ", ["code", p.get("oid", "")]],
+        ["p", _a(f"/commits/{commit_id}/patch", "download patch"), " · ",
+              _a(_evidence_path("event", ev.event_id), "raw event")],
+        ["h2", "message"],
+        _pre_blob(_blob_text(p.get("message")), cls="blob compact"),
+        ["h2", "comparisons involving this commit"],
+        *(related_cmp if related_cmp else [["p.note", "None yet."]]),
+        _fold("Full patch",
+              _pre_blob(_blob_text(p.get("patch")))),
+        _fold("Metadata", _dl_rows([
             ("commit_id", commit_id),
-            ("oid", p.get("oid", "")),
-            ("contributor", p.get("contributor", "")),
             ("patch_sha256", p.get("patch_sha256")),
             ("patch_identity", p.get("patch_identity")),
             ("committer_timestamp_ms", p.get("committer_timestamp_ms")),
-            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
-            ("epoch", _a(_evidence_path("epoch", str(epoch)), str(epoch))),
-        ]),
-        ["p", _a(f"/commits/{commit_id}/patch", "download patch")],
-        ["h2", "message"],
-        _pre_blob(_blob_text(p.get("message"))),
-        ["h2", "patch"],
-        _pre_blob(_blob_text(p.get("patch"))),
+        ])),
     ])
 
 
@@ -2554,6 +2661,7 @@ async def comparison_detail(comparison_id: str):
     p = ev.payload
     side_a = p.get("side_a") or {}
     side_b = p.get("side_b") or {}
+    judgments = _judgments_for_comparison(comparison_id)
     attempt_links = []
     for a in evidence_by_kind("llm.attempt_started"):
         if a.payload.get("comparison_id") == comparison_id:
@@ -2563,53 +2671,59 @@ async def comparison_detail(comparison_id: str):
                     f"{a.payload.get('model_id')} #{a.payload.get('attempt_number')}",
                     _evidence_path("attempt", aid),
                 ))
-    judgment_links = []
-    for j in evidence_by_kind("llm.judgment"):
-        if j.payload.get("comparison_id") == comparison_id:
-            jid = j.payload.get("judgment_id")
-            if jid:
-                judgment_links.append((
-                    j.payload.get("summary") or jid,
-                    _evidence_path("judgment", jid),
-                ))
-    commit_ids = []
-    for side in (side_a, side_b):
-        cid = side.get("commit_id")
-        if cid:
-            commit_ids.append(cid)
-        else:
-            commit_ids.extend(side.get("commit_ids") or [])
-    commit_links = [(cid, _evidence_path("commit", cid)) for cid in commit_ids]
+    judgment_links = [
+        (
+            j.payload.get("summary") or j.payload.get("judgment_id", j.event_id),
+            _evidence_path("judgment", j.payload["judgment_id"]),
+        )
+        for j in judgments
+        if j.payload.get("judgment_id")
+    ]
+    cid_a = side_a.get("commit_id") or (side_a.get("commit_ids") or [None])[0]
+    cid_b = side_b.get("commit_id") or (side_b.get("commit_ids") or [None])[0]
     return _evidence_page(f"comparison {comparison_id[:24]}", [
         _evidence_nav(_a(_evidence_path("epoch", str(ev.epoch)), f"epoch {ev.epoch}")),
         ["div.eyebrow", "comparison"],
-        ["h1", comparison_id],
-        _dl_rows([
-            ("summary", p.get("summary")),
-            ("ranking_run_id", p.get("ranking_run_id")),
-            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
-            ("side_a", f"{side_a.get('commit_id', '?')} ({side_a.get('contributor', '?')})"),
-            ("side_b", f"{side_b.get('commit_id', '?')} ({side_b.get('contributor', '?')})"),
-        ]),
-        ["p", _a(f"/comparisons/{comparison_id}/prompt", "download prompt")],
-        ["h2", "commits"],
-        _link_list(commit_links),
-        ["h2", "attempts"],
-        _link_list(attempt_links),
-        ["h2", "judgments"],
-        _link_list(judgment_links),
-        ["h2", "prompt"],
-        _pre_blob(_blob_text(p.get("prompt"))),
-        ["h2", f"side A — {side_a.get('commit_id', side_a.get('contributor', '?'))}"],
-        ["h3", "message"],
-        _pre_blob(_blob_text(side_a.get("message"))),
-        ["h3", "diff"],
-        _pre_blob(_blob_text(side_a.get("diff"))),
-        ["h2", f"side B — {side_b.get('commit_id', side_b.get('contributor', '?'))}"],
-        ["h3", "message"],
-        _pre_blob(_blob_text(side_b.get("message"))),
-        ["h3", "diff"],
-        _pre_blob(_blob_text(side_b.get("diff"))),
+        ["h1", f"{_side_label(side_a)} vs {_side_label(side_b)}"],
+        ["p.lede",
+            _a(f"/comparisons/{comparison_id}/prompt", "download prompt"),
+            " · ",
+            _a(_evidence_path("event", ev.event_id), "raw event"),
+            " · ",
+            ["code", _short_id(comparison_id, 18)],
+        ],
+        ["h2", "council reasoning"],
+        *_judgment_blocks(judgments),
+        ["h2", "sides"],
+        ["div.sides",
+            ["section.side",
+                ["h3", "A — ",
+                    (_a(_evidence_path("commit", cid_a), _side_label(side_a))
+                     if cid_a else _side_label(side_a))],
+                ["h4", "message"],
+                _pre_blob(_blob_text(side_a.get("message")), cls="blob compact"),
+                _fold("Full diff A",
+                      _pre_blob(_blob_text(side_a.get("diff")))),
+            ],
+            ["section.side",
+                ["h3", "B — ",
+                    (_a(_evidence_path("commit", cid_b), _side_label(side_b))
+                     if cid_b else _side_label(side_b))],
+                ["h4", "message"],
+                _pre_blob(_blob_text(side_b.get("message")), cls="blob compact"),
+                _fold("Full diff B",
+                      _pre_blob(_blob_text(side_b.get("diff")))),
+            ],
+        ],
+        _fold("Hardlinks — judgments / attempts / prompt",
+              ["p", _a(f"/comparisons/{comparison_id}/prompt", "prompt download")],
+              ["h3", "judgments"],
+              _link_list(judgment_links) if judgment_links else ["p.note", "(none)"],
+              ["h3", "attempts"],
+              _link_list(attempt_links) if attempt_links else ["p.note", "(none)"],
+              _fold("Full prompt text",
+                    _pre_blob(_blob_text(p.get("prompt")))),
+        ),
     ])
 
 
@@ -2706,15 +2820,20 @@ async def judgment_detail(judgment_id: str):
             ),
         ),
         ["div.eyebrow", "judgment"],
-        ["h1", judgment_id],
-        _dl_rows([
+        ["h1", f"{p.get('model_id') or '?'} → {p.get('winner')} ({p.get('ratio')})"],
+        ["p.lede", ["code", _short_id(judgment_id, 18)], " · ",
+              _a(_evidence_path("event", ev.event_id), "raw event")],
+        ["article.judgment",
+            ["p.explanation", p.get("explanation") or "(no explanation)"],
+        ],
+        _fold("Metadata", _dl_rows([
+            ("judgment_id", judgment_id),
             ("model_id", p.get("model_id")),
             ("winner", p.get("winner")),
             ("ratio", p.get("ratio")),
-            ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
-        ]),
-        ["h2", "explanation"],
-        _pre_blob(p.get("explanation") or ""),
+            ("comparison_id", p.get("comparison_id")),
+            ("attempt_id", p.get("attempt_id")),
+        ])),
     ])
 
 
@@ -2994,7 +3113,7 @@ code {
   padding: 1px 4px;
 }
 
-body.evidence-doc { max-width: 840px; }
+body.evidence-doc { max-width: 960px; }
 .kv-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .kv { display: grid; gap: 8px; grid-template-columns: 140px 1fr; }
 .kv .k { color: var(--meta); font-family: var(--font-code); font-size: 11px; }
@@ -3014,9 +3133,82 @@ pre.blob {
   white-space: pre-wrap;
   word-break: break-word;
 }
+pre.blob.compact { max-height: 12em; margin-bottom: 8px; }
 ul { padding-left: 1.2em; }
 li { margin: 4px 0; }
+p.lede { color: var(--ui); margin: 0 0 1em; }
+.dense-card {
+  background: var(--g2);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  margin: 0 0 10px;
+  padding: 8px 10px;
+}
+.card-head { color: var(--ui); font-family: var(--font-code); font-size: 12px; margin-bottom: 6px; }
+.reason-list { margin: 0; padding-left: 1.1em; }
+.reason-list li { color: var(--prose); font-family: var(--font-prose); line-height: 1.45; }
+.judgment {
+  background: var(--g1);
+  border-left: 3px solid var(--link);
+  margin: 0 0 10px;
+  padding: 8px 10px;
+}
+.judgment-meta { color: var(--ui); font-family: var(--font-code); font-size: 12px; margin-bottom: 6px; }
+.judgment .winner { color: #7acc7a; }
+.judgment .ratio { color: var(--meta); }
+.judgment .explanation {
+  color: var(--prose);
+  font-family: var(--font-prose);
+  font-size: 15px;
+  line-height: 1.5;
+  margin: 0;
+  white-space: pre-wrap;
+}
+.sides {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 12px;
+}
+.side {
+  background: var(--g2);
+  border: var(--bv) solid;
+  border-color: var(--hi) var(--lo) var(--lo) var(--hi);
+  padding: 8px 10px;
+}
+.side h3, .side h4 { margin: 0 0 6px; }
+details.fold {
+  background: var(--g2);
+  border: 1px solid var(--g4);
+  margin: 8px 0;
+  padding: 6px 10px;
+}
+details.fold > summary {
+  color: var(--ui);
+  cursor: pointer;
+  font-family: var(--font-code);
+  font-size: 12px;
+  list-style: disclosure-closed;
+}
+details.fold[open] > summary { margin-bottom: 8px; }
+table.dense {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 8px 0 16px;
+  width: 100%;
+}
+table.dense th, table.dense td {
+  border-bottom: 1px solid var(--g4);
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+table.dense th { color: var(--meta); font-family: var(--font-code); font-weight: 500; }
+table.dense td.msg { color: var(--prose); font-family: var(--font-prose); }
 
+@media (max-width: 720px) {
+  .sides { grid-template-columns: 1fr; }
+}
 @media (max-width: 520px) {
   .event { grid-template-columns: 72px 1fr; }
   .event-message { grid-column: 1 / -1; }
