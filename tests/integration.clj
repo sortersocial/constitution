@@ -247,7 +247,10 @@
                :decay_rate   "0.003253356063468"
                :distributions {"alice" "381.4282558872" "bob" "190.7141279436"}
                :ranking       {"alice" "0.6666" "bob" "0.3334"}
-               :models_used   ["mock/chat-v1" "mock/chat-v2"]}]
+               :models_used   ["mock/chat-v1" "mock/chat-v2"]
+               :evidence_schema_version 2
+               :ranking_run_id "seed-rank"
+               :ranking_event_id "seed-rank-ev"}]
     (spit path (str (json/generate-string entry) "\n"))))
 
 ;; ---------------------------------------------------------------------------

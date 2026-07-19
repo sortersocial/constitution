@@ -210,10 +210,10 @@ class Emission:
     distributions: dict   # author -> amount str
     ranking: dict         # author -> score str
     models_used: list
-    discovery_snapshot_id: str = ""  # empty only for pre-discovery ledger history
-    evidence_schema_version: int = 1
-    ranking_run_id: str = ""
-    ranking_event_id: str = ""
+    discovery_snapshot_id: str
+    evidence_schema_version: int
+    ranking_run_id: str
+    ranking_event_id: str
 
 
 @event
@@ -500,26 +500,6 @@ def _epochs_in_ledger() -> list[int]:
         if isinstance(e, (GitDiscovery, Emission, Evidence)):
             epochs.add(e.epoch)
     return sorted(epochs)
-
-
-def _legacy_commit_row(commit_id: str) -> tuple[GitDiscovery | None, dict | None]:
-    for discovery in store.read():
-        if not isinstance(discovery, GitDiscovery):
-            continue
-        for commit in discovery.commits:
-            if commit_id_for_oid(commit["oid"]) == commit_id:
-                return discovery, commit
-    return None, None
-
-
-def _legacy_observation(commit_id: str) -> tuple[GitDiscovery | None, dict | None]:
-    for discovery in store.read():
-        if not isinstance(discovery, GitDiscovery):
-            continue
-        for obs in discovery.observations:
-            if commit_id_for_oid(obs["oid"]) == commit_id:
-                return discovery, obs
-    return None, None
 
 
 def build_pairwise_prompt(side_a: dict, side_b: dict) -> str:
@@ -2040,7 +2020,7 @@ def _strip_heavy_fields(obj: dict) -> dict:
 
 @app.get("/api/ledger")
 async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
-    """List of ledger dicts (backward-compatible). Heavy blobs stripped unless full=1."""
+    """List of ledger dicts. Heavy blobs stripped unless full=1."""
     limit = max(1, min(limit, 500))
     rows = []
     for e in store.read()[offset:offset + limit]:
@@ -2274,23 +2254,25 @@ async def epochs_index():
     epochs = _epochs_in_ledger()
     rows = []
     for epoch in epochs:
-        discovery = _discovery_for_epoch(epoch)
         emission = _emission_for_epoch(epoch)
-        evidence_n = sum(
-            1 for e in evidence_by_kind() if e.epoch == epoch
+        evidence_n = sum(1 for e in evidence_by_kind() if e.epoch == epoch)
+        disc = next(
+            (
+                e for e in evidence_by_kind("git.discovery_completed")
+                if e.epoch == epoch
+            ),
+            None,
         )
         detail = []
-        if discovery:
+        if disc:
             detail.append(
-                f"{len(discovery.commits)} eligible / "
-                f"{len(discovery.observations)} observed"
+                f"{disc.payload.get('eligible_count', 0)} eligible / "
+                f"{disc.payload.get('observation_count', 0)} observed"
             )
         if emission:
             detail.append(f"emitted {emission.total_emitted}")
         if evidence_n:
             detail.append(f"{evidence_n} evidence events")
-        elif discovery or emission:
-            detail.append("legacy (no Evidence envelopes)")
         rows.append(["li",
             _a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}"),
             " — ",
@@ -2307,37 +2289,37 @@ async def epochs_index():
 
 @app.get("/epochs/{epoch}")
 async def epoch_detail(epoch: int):
-    discovery = _discovery_for_epoch(epoch)
     emission = _emission_for_epoch(epoch)
     evidence_rows = [e for e in evidence_by_kind() if e.epoch == epoch]
+    if not evidence_rows and emission is None:
+        return _evidence_page(f"epoch {epoch}", [
+            _evidence_nav(),
+            ["h1", f"epoch {epoch}"],
+            ["p.note", "No evidence for this epoch."],
+        ])
+
     commit_evs = [e for e in evidence_rows if e.kind == "git.commit"]
     comparison_evs = [e for e in evidence_rows if e.kind == "comparison.input"]
     judgment_evs = [e for e in evidence_rows if e.kind == "llm.judgment"]
+    discovery_ev = next(
+        (e for e in evidence_rows if e.kind == "git.discovery_completed"), None
+    )
     ranking_started = next(
         (e for e in evidence_rows if e.kind == "ranking.started"), None
     )
     ranking_completed = next(
         (e for e in evidence_rows if e.kind == "ranking.completed"), None
     )
-    legacy = not evidence_rows and (discovery is not None or emission is not None)
 
-    commit_links: list[tuple[str, str]] = []
-    if commit_evs:
-        for e in commit_evs:
-            cid = e.payload.get("commit_id") or ""
-            label = (
-                f"{e.payload.get('oid', cid)[:24]} "
-                f"({e.payload.get('contributor', '?')})"
-            )
-            commit_links.append((label, _evidence_path("commit", cid)))
-    elif discovery:
-        for c in discovery.commits:
-            cid = commit_id_for_oid(c["oid"])
-            commit_links.append((
-                f"{c['oid'][:24]} ({c.get('contributor', '?')})",
-                _evidence_path("commit", cid),
-            ))
-
+    commit_links = [
+        (
+            f"{e.payload.get('oid', e.payload.get('commit_id', ''))[:24]} "
+            f"({e.payload.get('contributor', '?')})",
+            _evidence_path("commit", e.payload["commit_id"]),
+        )
+        for e in commit_evs
+        if e.payload.get("commit_id")
+    ]
     comparison_links = [
         (
             e.payload.get("summary") or e.payload.get("comparison_id", e.event_id),
@@ -2360,16 +2342,13 @@ async def epoch_detail(epoch: int):
     ]
 
     excluded = []
-    if discovery:
-        for obs in discovery.observations:
+    if discovery_ev:
+        for obs in discovery_ev.payload.get("observations") or []:
             if obs.get("eligible"):
                 continue
             oid = obs.get("oid", "?")
             reason = obs.get("exclusion_reason") or "excluded"
-            excluded.append(["li",
-                f"{oid[:28]} — {reason} — ",
-                ["span.note", "legacy evidence unavailable"],
-            ])
+            excluded.append(["li", f"{oid[:28]} — {reason}"])
 
     ranking_nodes: list = []
     if ranking_completed:
@@ -2388,21 +2367,10 @@ async def epoch_detail(epoch: int):
                 indent=2, sort_keys=True,
             )],
         ]
-    elif emission:
-        if legacy and len(emission.ranking or {}) <= 1:
-            ranking_nodes.append(["p.note",
-                "Single-contributor epoch — no LLM judgments."
-            ])
-        ranking_nodes.extend([
-            ["p", "Projected from Emission (no ranking Evidence event)."],
-            ["pre.blob", json.dumps(emission.ranking, indent=2, sort_keys=True)],
-        ])
+    elif ranking_started:
+        ranking_nodes = [["p.note", f"Ranking started: {ranking_started.event_id}"]]
     else:
-        ranking_nodes = [["p.note", "No ranking recorded."]]
-    if ranking_started and not ranking_completed:
-        ranking_nodes.insert(0, ["p.note",
-            f"Ranking started: {ranking_started.event_id}"
-        ])
+        ranking_nodes = [["p.note", "No ranking evidence."]]
 
     if emission:
         emission_node = _dl_rows([
@@ -2411,44 +2379,41 @@ async def epoch_detail(epoch: int):
             ("pool_after", emission.pool_after),
             ("discovery_snapshot_id", emission.discovery_snapshot_id),
             ("ranking_run_id", emission.ranking_run_id or None),
+            ("ranking_event_id", emission.ranking_event_id or None),
             ("models_used", ", ".join(emission.models_used or [])),
             ("distributions", json.dumps(emission.distributions, sort_keys=True)),
         ])
     else:
         emission_node = ["p.note", "No emission for this epoch."]
 
-    single_contributor = False
-    if discovery:
-        single_contributor = len({c.get("contributor") for c in discovery.commits}) <= 1
-    elif emission:
-        single_contributor = len(emission.ranking or {}) <= 1
+    contributors = {
+        e.payload.get("contributor")
+        for e in commit_evs
+        if e.payload.get("contributor")
+    }
+    no_comparisons_note = "No comparisons."
+    if len(contributors) <= 1:
+        no_comparisons_note += " Single-contributor — no LLM judgments."
 
     body = [
         _evidence_nav(),
         ["div.eyebrow", f"epoch {epoch}"],
         ["h1", f"epoch {epoch}"],
     ]
-    if legacy:
-        body.append(["p.note",
-            "Legacy epoch: projected from GitDiscovery/Emission without Evidence "
-            "envelopes. Eligible commits use discovery patches; discarded observation "
-            "metadata is marked legacy evidence unavailable. Single-contributor "
-            "epochs have no LLM judgments."
-        ])
-    if discovery:
+    if discovery_ev:
         body.extend([
             ["h2", "discovery"],
             _dl_rows([
-                ("snapshot_id", discovery.snapshot_id),
-                ("config_digest", discovery.config_digest),
-                ("initial_snapshot", discovery.initial_snapshot),
-                ("observations", len(discovery.observations)),
-                ("eligible", len(discovery.commits)),
+                ("snapshot_id", discovery_ev.payload.get("snapshot_id")),
+                ("config_digest", discovery_ev.payload.get("config_digest")),
+                ("observations", discovery_ev.payload.get("observation_count")),
+                ("eligible", discovery_ev.payload.get("eligible_count")),
+                ("event", _a(
+                    _evidence_path("event", discovery_ev.event_id),
+                    discovery_ev.event_id,
+                )),
             ]),
         ])
-    no_comparisons_note = "No comparisons."
-    if single_contributor:
-        no_comparisons_note += " Single-contributor — no LLM judgments."
     body.extend([
         ["h2", "commits"],
         _link_list(commit_links),
@@ -2471,92 +2436,42 @@ async def epoch_detail(epoch: int):
 @app.get("/commits/{commit_id}")
 async def commit_detail(commit_id: str):
     ev = find_evidence_payload("git.commit", "commit_id", commit_id)
-    discovery, legacy_row = (None, None)
     if not ev:
-        discovery, legacy_row = _legacy_commit_row(commit_id)
-    if not ev and not legacy_row:
-        discovery, obs = _legacy_observation(commit_id)
-        if obs is not None:
-            epoch = discovery.epoch if discovery else "?"
-            return _evidence_page(f"commit {commit_id[:24]}", [
-                _evidence_nav(
-                    _a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")
-                ),
-                ["div.eyebrow", "commit"],
-                ["h1", commit_id],
-                ["p.note", "legacy evidence unavailable"],
-                _dl_rows([
-                    ("oid", obs.get("oid")),
-                    ("eligible", obs.get("eligible")),
-                    ("exclusion_reason", obs.get("exclusion_reason")),
-                    ("epoch", str(epoch)),
-                ]),
-            ])
         return _evidence_page("commit not found", [
             _evidence_nav(),
             ["h1", "commit not found"],
             ["p", commit_id],
         ])
-    if ev:
-        p = ev.payload
-        epoch = ev.epoch
-        oid = p.get("oid", "")
-        contributor = p.get("contributor", "")
-        message = _blob_text(p.get("message"))
-        patch = _blob_text(p.get("patch"))
-        meta = _dl_rows([
+    p = ev.payload
+    epoch = ev.epoch
+    return _evidence_page(f"commit {commit_id[:24]}", [
+        _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),
+        ["div.eyebrow", "commit"],
+        ["h1", commit_id],
+        _dl_rows([
             ("commit_id", commit_id),
-            ("oid", oid),
-            ("contributor", contributor),
+            ("oid", p.get("oid", "")),
+            ("contributor", p.get("contributor", "")),
             ("patch_sha256", p.get("patch_sha256")),
             ("patch_identity", p.get("patch_identity")),
             ("committer_timestamp_ms", p.get("committer_timestamp_ms")),
             ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
             ("epoch", _a(_evidence_path("epoch", str(epoch)), str(epoch))),
-        ])
-        legacy_note = None
-    else:
-        assert legacy_row is not None and discovery is not None
-        epoch = discovery.epoch
-        oid = legacy_row.get("oid", "")
-        contributor = legacy_row.get("contributor", "")
-        message = legacy_row.get("message") or ""
-        patch = legacy_row.get("patch") or ""
-        meta = _dl_rows([
-            ("commit_id", commit_id),
-            ("oid", oid),
-            ("contributor", contributor),
-            ("patch_sha256", legacy_row.get("patch_sha256")),
-            ("patch_identity", legacy_row.get("patch_identity")),
-            ("committer_timestamp_ms", legacy_row.get("committer_timestamp_ms")),
-            ("epoch", _a(_evidence_path("epoch", str(epoch)), str(epoch))),
-            ("source", "legacy GitDiscovery projection"),
-        ])
-        legacy_note = ["p.note", "Projected from GitDiscovery — Evidence envelope absent."]
-    return _evidence_page(f"commit {commit_id[:24]}", [
-        _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),
-        ["div.eyebrow", "commit"],
-        ["h1", commit_id],
-        *([legacy_note] if legacy_note else []),
-        meta,
+        ]),
         ["p", _a(f"/commits/{commit_id}/patch", "download patch")],
         ["h2", "message"],
-        _pre_blob(message),
+        _pre_blob(_blob_text(p.get("message"))),
         ["h2", "patch"],
-        _pre_blob(patch),
+        _pre_blob(_blob_text(p.get("patch"))),
     ])
 
 
 @app.get("/commits/{commit_id}/patch")
 async def commit_patch_download(commit_id: str):
     ev = find_evidence_payload("git.commit", "commit_id", commit_id)
-    if ev:
-        raw = _decode_blob(ev.payload.get("patch")) or _blob_text(ev.payload.get("patch")).encode()
-    else:
-        _, row = _legacy_commit_row(commit_id)
-        if not row:
-            return PlainTextResponse("not found", status_code=404)
-        raw = (row.get("patch") or "").encode("utf-8")
+    if not ev:
+        return PlainTextResponse("not found", status_code=404)
+    raw = _decode_blob(ev.payload.get("patch")) or _blob_text(ev.payload.get("patch")).encode()
     return Response(
         content=raw,
         media_type="text/plain; charset=utf-8",
@@ -3226,7 +3141,9 @@ async def watch():
                 ["div.controls",
                     ["button#play", {"type": "button", "disabled": "true"}, "▶ Play live feed"],
                     ["button#pause", {"type": "button"}, "Ⅱ Pause feed"],
-                    ["span.note", "Pause stops local updates; the constitutional process continues."],
+                    ["span.note",
+                     "Play/pause only affect this browser feed — they do not run or stop emission. "
+                     "The server emits at each epoch boundary; status above is that process."],
                 ],
             ],
             ["section.panel",

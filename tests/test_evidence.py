@@ -1,4 +1,4 @@
-"""HTML evidence graph: byte fidelity, resume, legacy projection, private ack."""
+"""HTML evidence graph: byte fidelity, resume, and Evidence-only pages."""
 
 from __future__ import annotations
 
@@ -86,55 +86,10 @@ def test_html_evidence_pages_escape_and_link(evidence_store):
     assert patch_resp.headers["content-disposition"].startswith("attachment")
 
 
-def test_legacy_epoch_projects_from_gitdiscovery_without_evidence(evidence_store):
-    oid = "sha1:" + "b" * 40
-    discovery = c.GitDiscovery(
-        schema_version=1,
-        epoch=3,
-        snapshot_id="legacy-snap",
-        timestamp_ms=1,
-        config_digest="d",
-        initial_snapshot=True,
-        configuration={"repositories": [], "contributors": {}},
-        repositories=[],
-        observations=[{
-            "oid": oid,
-            "eligible": False,
-            "exclusion_reason": "before_genesis",
-            "first_sources": [],
-        }, {
-            "oid": "sha1:" + "c" * 40,
-            "eligible": True,
-            "exclusion_reason": None,
-            "first_sources": [],
-        }],
-        commits=[{
-            "oid": "sha1:" + "c" * 40,
-            "contributor": "tommy-mor",
-            "message": "eligible",
-            "patch": "diff --git a/x b/x\n",
-        }],
-    )
-    emission = c.Emission(
-        epoch=3,
-        timestamp_ms=2,
-        pool_before="1",
-        total_emitted="0.1",
-        pool_after="0.9",
-        decay_rate="0.1",
-        distributions={"tommy-mor": "0.1"},
-        ranking={"tommy-mor": "1"},
-        models_used=[],
-        discovery_snapshot_id="legacy-snap",
-    )
-    asyncio.run(c.store.append(discovery))
-    asyncio.run(c.store.append(emission))
-    html = asyncio.run(c.epoch_detail(3)).body.decode()
-    assert "legacy" in html.lower()
-    assert "Single-contributor" in html or "no LLM" in html
-    excluded_id = c.commit_id_for_oid(oid)
-    excluded_html = asyncio.run(c.commit_detail(excluded_id)).body.decode()
-    assert "legacy evidence unavailable" in excluded_html.lower()
+def test_commit_without_evidence_is_not_found(evidence_store):
+    html = asyncio.run(c.commit_detail("c_missing")).body.decode()
+    assert "commit not found" in html
+    assert "legacy" not in html.lower()
 
 
 def test_ranking_resume_skips_duplicate_provider_calls(evidence_store, monkeypatch):
@@ -202,6 +157,10 @@ def test_epochs_index_lists_epochs(evidence_store):
         distributions={},
         ranking={},
         models_used=[],
+        discovery_snapshot_id="snap",
+        evidence_schema_version=c.EVIDENCE_SCHEMA_VERSION,
+        ranking_run_id="r",
+        ranking_event_id="e",
     )))
     html = asyncio.run(c.epochs_index()).body.decode()
     assert "/epochs/3" in html
