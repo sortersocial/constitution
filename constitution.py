@@ -6,7 +6,8 @@
 #   "uvicorn",
 #   "httpx",
 #   "tenacity",
-#   "evaleval==0.2.7",
+#   "evaleval @ git+https://github.com/tommy-mor/evaleval.git@584225b43f37261b446ad04169aaddf77ca6c201",
+#   "rocksdict>=0.3.29",
 #   "authlib",
 #   "itsdangerous",
 #   "starlette",
@@ -34,9 +35,11 @@ import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl, 
 import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from evaleval import (
-    event, JsonlStore, to_dict, render, RawContent, Signer, SnippetExecutionError,
-    exec_event, One, Two, Three, Selector, MORPH, PREPEND,
+    event, to_dict, from_dict, render, RawContent, Signer,
+    SnippetExecutionError, exec_event, Selector, MORPH, PREPEND,
+    Record, Leaf, Map, List, Deque, Sum, RocksDb, Durability,
 )
+from evaleval.depth import One, Two, Three
 
 DefaultContext.prec = 50
 getcontext().prec = 50
@@ -113,6 +116,9 @@ CONTRIBUTOR_POOL = TOTAL_SUPPLY - LP_TOKENS
 
 GENESIS_MS = int(os.environ["GENESIS_MS"])
 JSONL_PATH = pathlib.Path(os.environ.get("JSONL_PATH", "/data/ledger.jsonl"))
+ROCKS_PATH = pathlib.Path(
+    os.environ.get("ROCKS_PATH", "/data/constitution.rocks")
+)
 
 # ===========================================================================
 # §1c. CONFIGURATION — environment variables and constants
@@ -270,43 +276,97 @@ class Evidence:
     payload: dict
 
 
-class DeferredJsonlStore:
-    """
-    Delay ledger replay until after the HTTP server binds.
-
-    A 450MB+ evidence ledger can take minutes to parse; doing that at import
-    time makes Fly health checks and the public site time out on every boot.
-    """
-
-    def __init__(self, path: pathlib.Path | str):
-        self.path = pathlib.Path(path)
-        self._inner: JsonlStore | None = None
-        self.ready = False
-
-    def load_sync(self) -> None:
-        self._inner = JsonlStore(self.path)
-        self.ready = True
-
-    def _require(self) -> JsonlStore:
-        if self._inner is None:
-            self.load_sync()
-        assert self._inner is not None
-        return self._inner
-
-    def read(self) -> list:
-        if self._inner is None:
-            return []
-        return self._inner.read()
-
-    async def append(self, e) -> None:
-        await self._require().append(e)
-
-    async def atomic(self, fn):
-        return await self._require().atomic(fn)
-
-
-store = DeferredJsonlStore(JSONL_PATH)
+# Direct application schema. Paths are the query/mutation interface; values are
+# plain dictionaries compatible with the unchanged JSONL/CBOR tape contract.
+STATE = Record(
+    events=List(Leaf()),                         # canonical tape order
+    evidence_by_id=Map(Leaf()),                  # event_id -> evidence dict
+    event_ids_by_kind=Map(List(Leaf())),         # kind -> ordered event ids
+    event_ids_by_epoch=Map(List(Leaf())),        # epoch -> ordered event ids
+    evidence_count_by_epoch=Map(Sum()),
+    discovery_evidence_by_epoch=Map(Leaf()),
+    entity_event_ids=Map(Map(Leaf())),            # entity field -> id -> event id
+    evidence_by_entity=Map(Leaf()),               # (kind, field, id) -> event id
+    judgment_ids_by_comparison=Map(List(Leaf())),
+    judgment_id_by_attempt=Map(Leaf()),
+    attempt_ids_by_comparison=Map(List(Leaf())),
+    comparison_ids_by_commit=Map(List(Leaf())),
+    emissions_by_epoch=Map(Leaf()),
+    emission_epochs=Map(Leaf()),
+    latest_emission=Leaf(),
+    discoveries_by_epoch=Map(Leaf()),
+    discovery_epochs=Map(Leaf()),
+    latest_discovery=Leaf(),
+    epochs=Map(Leaf()),
+    blobs=Map(Leaf()),                            # sha256 -> raw bytes
+    seen_git_oids=Map(Leaf()),
+    canonical_patch_oids=Map(Leaf()),
+    meta=Record(
+        chain_head=Leaf(),
+        total_emitted=Leaf(),
+        imported_count=Leaf(),
+        tape_sha256=Leaf(),
+    ),
+)
+ROOT = STATE.root("constitution-v1")
+state_db: RocksDb | None = None
 _LEDGER_LOCK = asyncio.Lock()
+STATE_STATUS = {
+    "ready": False,
+    "importing": False,
+    "error": None,
+    "event_count": 0,
+}
+
+
+def _db() -> RocksDb:
+    global state_db
+    if state_db is None:
+        state_db = RocksDb.open(ROCKS_PATH)
+    return state_db
+
+
+def prepare_state_sync() -> dict:
+    """Open live state, optionally importing an archival tape first.
+
+    The probe handle is always closed before the importer opens RocksDB. A
+    nonempty projection is opened as-is and is never overwritten, even when
+    ``IMPORT_JSONL_ON_EMPTY=1``.
+    """
+    global state_db
+    if state_db is not None:
+        count = ROOT.events.len(state_db)
+        STATE_STATUS.update(
+            ready=True, importing=False, error=None, event_count=count
+        )
+        return dict(STATE_STATUS)
+
+    STATE_STATUS.update(ready=False, importing=False, error=None, event_count=0)
+    probe = RocksDb.open(ROCKS_PATH)
+    count = ROOT.events.len(probe)
+    probe.close()
+
+    should_import = os.environ.get("IMPORT_JSONL_ON_EMPTY") == "1"
+    if count == 0 and should_import:
+        if not JSONL_PATH.is_file():
+            message = f"archival tape not found: {JSONL_PATH}"
+            STATE_STATUS["error"] = message
+            raise RuntimeError(message)
+        STATE_STATUS["importing"] = True
+        try:
+            import_jsonl_tape(JSONL_PATH, ROCKS_PATH)
+        except BaseException as exc:
+            STATE_STATUS.update(importing=False, error=str(exc))
+            raise
+        finally:
+            STATE_STATUS["importing"] = False
+
+    state_db = RocksDb.open(ROCKS_PATH)
+    count = ROOT.events.len(state_db)
+    STATE_STATUS.update(
+        ready=True, importing=False, error=None, event_count=count
+    )
+    return dict(STATE_STATUS)
 
 
 # ===========================================================================
@@ -340,7 +400,71 @@ def _bytes_blob(data: bytes | str) -> dict:
 def _decode_blob(blob: dict | None) -> bytes:
     if not blob:
         return b""
+    if blob.get("encoding") == "blob" and blob.get("sha256"):
+        return ROOT.blobs.key(blob["sha256"]).get(_db()) or b""
     return base64.b64decode(blob["data"].encode("ascii"))
+
+
+def _externalize_blob(blob: dict) -> tuple[dict, tuple[str, bytes] | None]:
+    """Replace an inline base64 blob with a content-addressed reference."""
+    if blob.get("encoding") != "base64" or not isinstance(blob.get("data"), str):
+        return blob, None
+    raw = base64.b64decode(blob["data"].encode("ascii"))
+    sha = blob.get("sha256") or _sha256_hex(raw)
+    return {
+        "encoding": "blob",
+        "sha256": sha,
+        "byte_length": len(raw),
+    }, (sha, raw)
+
+
+_HEAVY_BLOB_FIELDS = {"patch", "prompt", "request", "response", "diff"}
+
+
+def _externalize_payload(payload: dict) -> tuple[dict, list[tuple[str, bytes]]]:
+    """Externalize new heavy fields recursively; imported envelopes stay intact."""
+    blobs: list[tuple[str, bytes]] = []
+
+    def walk(value, field: str | None = None):
+        if field in _HEAVY_BLOB_FIELDS and isinstance(value, (str, bytes)):
+            raw = value.encode("utf-8") if isinstance(value, str) else value
+            sha = _sha256_hex(raw)
+            blobs.append((sha, raw))
+            return {
+                "encoding": "blob",
+                "sha256": sha,
+                "byte_length": len(raw),
+            }
+        if isinstance(value, dict):
+            if field in _HEAVY_BLOB_FIELDS:
+                ref, blob = _externalize_blob(value)
+                if blob:
+                    blobs.append(blob)
+                    return ref
+            return {key: walk(child, key) for key, child in value.items()}
+        if isinstance(value, list):
+            return [walk(child) for child in value]
+        return value
+
+    return walk(payload), blobs
+
+
+def _hydrate_heavy_fields(value, field: str | None = None):
+    """Restore ref-backed text fields for computation-heavy domain objects."""
+    if (
+        field in _HEAVY_BLOB_FIELDS
+        and isinstance(value, dict)
+        and value.get("encoding") == "blob"
+    ):
+        return _decode_blob(value).decode("utf-8", "replace")
+    if isinstance(value, dict):
+        return {
+            key: _hydrate_heavy_fields(child, key)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_hydrate_heavy_fields(child) for child in value]
+    return value
 
 
 def _content_id(prefix: str, material) -> str:
@@ -373,13 +497,12 @@ def _evidence_url(kind: str, entity_id: str) -> str:
     return PUBLIC_BASE_URL + _evidence_path(kind, entity_id)
 
 
-def _previous_event_sha256(events: list) -> str:
-    for event_ in reversed(events):
-        if isinstance(event_, Evidence):
-            return event_.event_id.split("_", 1)[-1]
-        if isinstance(event_, (GitDiscovery, Emission)):
-            return _sha256_hex(_canonical_json(to_dict(event_)))
-    return "0" * 64
+def _chain_digest(row: dict) -> str | None:
+    if row.get("type") == "evidence":
+        return str(row["event_id"]).split("_", 1)[-1]
+    if row.get("type") in {"gitdiscovery", "emission"}:
+        return _sha256_hex(_canonical_json(row))
+    return None
 
 
 def _public_repo_row(repo: dict) -> dict:
@@ -395,11 +518,335 @@ def _ledger_lock_path() -> pathlib.Path:
     env = os.environ.get("LEDGER_LOCK_PATH")
     if env:
         return pathlib.Path(env)
-    return pathlib.Path(str(store.path) + ".lock")
+    return pathlib.Path(str(ROCKS_PATH) + ".lock")
+
+
+_ENTITY_FIELDS = (
+    "commit_id", "comparison_id", "attempt_id", "judgment_id",
+    "ranking_run_id", "snapshot_id", "oid",
+)
+
+
+def _event_writes(row: dict, *, blobs: list[tuple[str, bytes]] | None = None) -> list:
+    """Lower one tape row to canonical storage plus all direct indexes."""
+    writes = [ROOT.events.push(row)]
+    event_type = row.get("type")
+    epoch = row.get("epoch")
+    if isinstance(epoch, int):
+        writes.append(ROOT.epochs.key(epoch).set(True))
+
+    if event_type == "evidence":
+        event_id = row["event_id"]
+        kind = row["kind"]
+        payload = row.get("payload") or {}
+        writes.extend([
+            ROOT.evidence_by_id.key(event_id).set(row),
+            ROOT.event_ids_by_kind.key(kind).push(event_id),
+            ROOT.event_ids_by_epoch.key(int(row["epoch"])).push(event_id),
+            ROOT.evidence_count_by_epoch.key(int(row["epoch"])).add(1),
+        ])
+        if kind == "git.discovery_completed":
+            writes.append(
+                ROOT.discovery_evidence_by_epoch
+                .key(int(row["epoch"])).set(event_id)
+            )
+        for field in _ENTITY_FIELDS:
+            value = payload.get(field)
+            if value is not None:
+                writes.extend([
+                    ROOT.entity_event_ids.key(field).key(str(value)).set(event_id),
+                    ROOT.evidence_by_entity
+                    .key((kind, field, str(value))).set(event_id),
+                ])
+        comparison_id = payload.get("comparison_id")
+        if kind == "llm.judgment" and comparison_id:
+            writes.append(
+                ROOT.judgment_ids_by_comparison
+                .key(str(comparison_id)).push(event_id)
+            )
+            if payload.get("attempt_id"):
+                writes.append(
+                    ROOT.judgment_id_by_attempt
+                    .key(str(payload["attempt_id"])).set(event_id)
+                )
+        if kind.startswith("llm.attempt_") and comparison_id:
+            writes.append(
+                ROOT.attempt_ids_by_comparison
+                .key(str(comparison_id)).push(event_id)
+            )
+        if kind == "comparison.input":
+            comparison_id = payload.get("comparison_id")
+            if comparison_id:
+                for side_name in ("side_a", "side_b"):
+                    side = payload.get(side_name) or {}
+                    commit_ids = {
+                        side.get("commit_id"),
+                        *(side.get("commit_ids") or []),
+                    }
+                    for commit_id in commit_ids - {None}:
+                        writes.append(
+                            ROOT.comparison_ids_by_commit
+                            .key(str(commit_id)).push(str(comparison_id))
+                        )
+
+    elif event_type == "emission":
+        epoch = int(row["epoch"])
+        writes.extend([
+            ROOT.emissions_by_epoch.key(epoch).set(row),
+            ROOT.emission_epochs.key(epoch).set(True),
+            ROOT.latest_emission.set(row),
+            ROOT.meta.total_emitted.set(
+                str(CONTRIBUTOR_POOL - Decimal(row["pool_after"]))
+            ),
+        ])
+
+    elif event_type == "gitdiscovery":
+        epoch = int(row["epoch"])
+        writes.extend([
+            ROOT.discoveries_by_epoch.key(epoch).set(row),
+            ROOT.discovery_epochs.key(epoch).set(True),
+            ROOT.latest_discovery.set(row),
+        ])
+        for observation in row.get("observations") or []:
+            oid = observation.get("oid")
+            if oid:
+                writes.append(ROOT.seen_git_oids.key(oid).set(True))
+            patch_identity = observation.get("patch_identity")
+            canonical_oid = observation.get("canonical_patch_oid")
+            if patch_identity and canonical_oid:
+                writes.append(
+                    ROOT.canonical_patch_oids.key(patch_identity).set(canonical_oid)
+                )
+
+    digest = _chain_digest(row)
+    if digest:
+        writes.append(ROOT.meta.chain_head.set(digest))
+    for sha, raw in blobs or []:
+        writes.append(ROOT.blobs.key(sha).set(raw))
+    return writes
+
+
+def _typed(row: dict | None):
+    return from_dict(row) if row else None
+
+
+def _evidence_from_ids(ids: list[str]) -> list[Evidence]:
+    rows = []
+    db = _db()
+    for event_id in ids:
+        event_ = _typed(ROOT.evidence_by_id.key(event_id).get(db))
+        if isinstance(event_, Evidence):
+            rows.append(event_)
+    return rows
+
+
+def _evidence_for_kind(kind: str) -> list[Evidence]:
+    path = ROOT.event_ids_by_kind.key(kind)
+    return _evidence_from_ids(path.iter(_db()) if path.len(_db()) else [])
+
+
+def _evidence_for_epoch(epoch: int) -> list[Evidence]:
+    path = ROOT.event_ids_by_epoch.key(epoch)
+    return _evidence_from_ids(path.iter(_db()) if path.len(_db()) else [])
+
+
+def verify_rocks_projection(db: RocksDb, expected: dict | None = None) -> dict:
+    """Verify counts, chain end, and representative direct lookups."""
+    count = ROOT.events.len(db)
+    report = {
+        "event_count": count,
+        "chain_head": ROOT.meta.chain_head.get(db),
+        "evidence_count": ROOT.evidence_by_id.len(db),
+        "emission_count": ROOT.emissions_by_epoch.len(db),
+        "discovery_count": ROOT.discoveries_by_epoch.len(db),
+        "epoch_count": ROOT.epochs.len(db),
+        "representative_lookups": {},
+    }
+    if count:
+        first = ROOT.events.get(db, 0)
+        last = ROOT.events.get(db, count - 1)
+        report["first_type"] = first.get("type") if first else None
+        report["last_type"] = last.get("type") if last else None
+    for label, path in (
+        ("latest_emission", ROOT.latest_emission),
+        ("latest_discovery", ROOT.latest_discovery),
+    ):
+        row = path.get(db)
+        report["representative_lookups"][label] = bool(row)
+    evidence_page = ROOT.evidence_by_id.keys_page(db, limit=1)
+    if evidence_page.items:
+        event_id = evidence_page.items[0]
+        report["representative_lookups"]["evidence_event_id"] = event_id
+        report["representative_lookups"]["evidence_found"] = bool(
+            ROOT.evidence_by_id.key(event_id).get(db)
+        )
+
+    if expected:
+        checks = {
+            "event_count": report["event_count"] == expected["event_count"],
+            "chain_head": report["chain_head"] == expected["chain_head"],
+            "evidence_count": (
+                report["evidence_count"] == expected["evidence_count"]
+            ),
+            "emission_count": (
+                report["emission_count"] == expected["emission_count"]
+            ),
+            "discovery_count": (
+                report["discovery_count"] == expected["discovery_count"]
+            ),
+            "chain_links": expected.get("chain_mismatches", 0) == 0,
+        }
+        report["checks"] = checks
+        report["ok"] = all(checks.values())
+    else:
+        report["ok"] = True
+    return report
+
+
+def import_jsonl_tape(
+    tape_path: pathlib.Path | str,
+    rocks_path: pathlib.Path | str,
+    *,
+    batch_size: int = 100,
+    force: bool = False,
+) -> dict:
+    """One-shot streaming projection import.
+
+    Reads one JSON object per line and commits bounded groups. On any failure the
+    incomplete Rocks projection is destroyed; rerun from zero.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    tape_path = pathlib.Path(tape_path)
+    rocks_path = pathlib.Path(rocks_path)
+    if force and rocks_path.exists():
+        RocksDb.open(rocks_path).destroy()
+
+    db = RocksDb.open(rocks_path)
+    if ROOT.events.len(db):
+        db.close()
+        raise RuntimeError(
+            f"Rocks projection is not empty: {rocks_path}; use --force to rebuild"
+        )
+
+    digest = hashlib.sha256()
+    expected = {
+        "event_count": 0,
+        "evidence_count": 0,
+        "emission_count": 0,
+        "discovery_count": 0,
+        "chain_head": None,
+        "chain_mismatches": 0,
+    }
+    batch = db.batch()
+    pending = 0
+    pending_evidence_ids: set[str] = set()
+    pending_emission_epochs: set[int] = set()
+    pending_discovery_epochs: set[int] = set()
+    try:
+        with tape_path.open("rb") as tape:
+            for line_number, raw_line in enumerate(tape, start=1):
+                digest.update(raw_line)
+                if not raw_line.strip():
+                    continue
+                try:
+                    row = json.loads(raw_line)
+                except Exception as exc:
+                    raise ValueError(
+                        f"invalid JSONL at line {line_number}: {exc}"
+                    ) from exc
+                if not isinstance(row, dict) or not isinstance(row.get("type"), str):
+                    raise ValueError(f"invalid tape event at line {line_number}")
+
+                if row["type"] == "evidence":
+                    event_id = row.get("event_id")
+                    if not isinstance(event_id, str):
+                        raise ValueError(
+                            f"evidence missing event_id at line {line_number}"
+                        )
+                    if (
+                        event_id in pending_evidence_ids
+                        or ROOT.evidence_by_id.contains(db, event_id)
+                    ):
+                        raise ValueError(
+                            f"duplicate evidence event_id {event_id} "
+                            f"at line {line_number}"
+                        )
+                    pending_evidence_ids.add(event_id)
+                    expected["evidence_count"] += 1
+                    previous = row.get("previous_event_sha256")
+                    expected_previous = expected["chain_head"] or "0" * 64
+                    if previous != expected_previous:
+                        expected["chain_mismatches"] += 1
+                elif row["type"] == "emission":
+                    epoch = int(row["epoch"])
+                    if (
+                        epoch in pending_emission_epochs
+                        or ROOT.emissions_by_epoch.contains(db, epoch)
+                    ):
+                        raise ValueError(
+                            f"duplicate emission epoch {epoch} "
+                            f"at line {line_number}"
+                        )
+                    pending_emission_epochs.add(epoch)
+                    expected["emission_count"] += 1
+                elif row["type"] == "gitdiscovery":
+                    epoch = int(row["epoch"])
+                    if (
+                        epoch in pending_discovery_epochs
+                        or ROOT.discoveries_by_epoch.contains(db, epoch)
+                    ):
+                        raise ValueError(
+                            f"duplicate discovery epoch {epoch} "
+                            f"at line {line_number}"
+                        )
+                    pending_discovery_epochs.add(epoch)
+                    expected["discovery_count"] += 1
+
+                chain = _chain_digest(row)
+                if chain:
+                    expected["chain_head"] = chain
+                batch.extend(_event_writes(row))
+                expected["event_count"] += 1
+                pending += 1
+                if pending >= batch_size:
+                    batch.commit(Durability.WAL_ONLY)
+                    batch = db.batch()
+                    pending = 0
+                    pending_evidence_ids.clear()
+                    pending_emission_epochs.clear()
+                    pending_discovery_epochs.clear()
+
+        if pending:
+            batch.commit(Durability.WAL_ONLY)
+        db.apply(
+            [
+                ROOT.meta.imported_count.set(expected["event_count"]),
+                ROOT.meta.tape_sha256.set(digest.hexdigest()),
+            ],
+            Durability.SYNC_WAL,
+        )
+        report = verify_rocks_projection(db, expected)
+        report.update({
+            "tape_path": str(tape_path),
+            "rocks_path": str(rocks_path),
+            "tape_sha256": digest.hexdigest(),
+            "chain_mismatches": expected["chain_mismatches"],
+        })
+        if not report["ok"]:
+            raise RuntimeError(f"projection verification failed: {report['checks']}")
+        db.close()
+        return report
+    except BaseException:
+        try:
+            db.destroy()
+        finally:
+            pass
+        raise
 
 
 async def append_evidence(epoch: int, kind: str, payload: dict) -> Evidence:
-    """Durably append one Evidence event under process + file locks."""
+    """Atomically update canonical event, chain head, blobs, and indexes."""
     # Logical identity ignores chain links / wall clock so restarts stay idempotent.
     event_id = _content_id("ev", {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -408,53 +855,25 @@ async def append_evidence(epoch: int, kind: str, payload: dict) -> Evidence:
         "payload": payload,
     })
     async with _LEDGER_LOCK:
-        lock_path = _ledger_lock_path()
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+b") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                events = store.read()
-                existing = next(
-                    (
-                        e for e in events
-                        if isinstance(e, Evidence) and e.event_id == event_id
-                    ),
-                    None,
-                )
-                if existing:
-                    return existing
-                recorded_at_ms = int(time.time() * 1000)
-                previous = _previous_event_sha256(events)
-                evidence = Evidence(
-                    schema_version=EVIDENCE_SCHEMA_VERSION,
-                    event_id=event_id,
-                    epoch=epoch,
-                    kind=kind,
-                    recorded_at_ms=recorded_at_ms,
-                    previous_event_sha256=previous,
-                    payload=payload,
-                )
-
-                def append_once(current):
-                    if any(
-                        isinstance(e, Evidence) and e.event_id == event_id
-                        for e in current
-                    ):
-                        return None
-                    return evidence
-
-                appended = await store.atomic(append_once)
-                result = appended or next(
-                    e for e in store.read()
-                    if isinstance(e, Evidence) and e.event_id == event_id
-                )
-                try:
-                    with open(store.path, "rb") as fh:
-                        os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        db = _db()
+        existing = _typed(ROOT.evidence_by_id.key(event_id).get(db))
+        if isinstance(existing, Evidence):
+            return existing
+        stored_payload, blobs = _externalize_payload(payload)
+        evidence = Evidence(
+            schema_version=EVIDENCE_SCHEMA_VERSION,
+            event_id=event_id,
+            epoch=epoch,
+            kind=kind,
+            recorded_at_ms=int(time.time() * 1000),
+            previous_event_sha256=(
+                ROOT.meta.chain_head.get(db) or "0" * 64
+            ),
+            payload=stored_payload,
+        )
+        row = to_dict(evidence)
+        db.apply(_event_writes(row, blobs=blobs), Durability.SYNC_WAL)
+        result = evidence
     await broadcast_audit(
         kind,
         f"{kind}: {payload.get('summary') or event_id[:24]}",
@@ -466,24 +885,32 @@ async def append_evidence(epoch: int, kind: str, payload: dict) -> Evidence:
     return result
 
 
-def evidence_by_kind(kind: str | None = None) -> list[Evidence]:
-    rows = [e for e in store.read() if isinstance(e, Evidence)]
-    if kind is None:
-        return rows
-    return [e for e in rows if e.kind == kind]
+async def _append_typed_event(event_) -> object:
+    """Append a non-Evidence tape event and its indexes atomically."""
+    async with _LEDGER_LOCK:
+        if isinstance(event_, Emission):
+            existing = _emission_for_epoch(event_.epoch)
+            if existing is not None:
+                return existing
+        if isinstance(event_, GitDiscovery):
+            existing = _discovery_for_epoch(event_.epoch)
+            if existing is not None:
+                return existing
+        _db().apply(_event_writes(to_dict(event_)), Durability.SYNC_WAL)
+    return event_
 
 
 def find_evidence(event_id: str) -> Evidence | None:
-    return next(
-        (e for e in store.read() if isinstance(e, Evidence) and e.event_id == event_id),
-        None,
-    )
+    row = _typed(ROOT.evidence_by_id.key(event_id).get(_db()))
+    return row if isinstance(row, Evidence) else None
 
 
 def find_evidence_payload(kind: str, key: str, value: str) -> Evidence | None:
-    for e in evidence_by_kind(kind):
-        if e.payload.get(key) == value:
-            return e
+    event_id = ROOT.evidence_by_entity.key((kind, key, value)).get(_db())
+    if event_id:
+        event_ = find_evidence(event_id)
+        if event_ and event_.kind == kind:
+            return event_
     return None
 
 
@@ -523,31 +950,18 @@ def _blob_text(blob) -> str:
 
 
 def _discovery_for_epoch(epoch: int) -> GitDiscovery | None:
-    return next(
-        (
-            e for e in store.read()
-            if isinstance(e, GitDiscovery) and e.epoch == epoch
-        ),
-        None,
-    )
+    stored = ROOT.discoveries_by_epoch.key(epoch).get(_db())
+    row = _typed(_hydrate_heavy_fields(stored) if stored else None)
+    return row if isinstance(row, GitDiscovery) else None
 
 
 def _emission_for_epoch(epoch: int) -> Emission | None:
-    return next(
-        (
-            e for e in store.read()
-            if isinstance(e, Emission) and e.epoch == epoch
-        ),
-        None,
-    )
+    row = _typed(ROOT.emissions_by_epoch.key(epoch).get(_db()))
+    return row if isinstance(row, Emission) else None
 
 
 def _epochs_in_ledger() -> list[int]:
-    epochs: set[int] = set()
-    for e in store.read():
-        if isinstance(e, (GitDiscovery, Emission, Evidence)):
-            epochs.add(e.epoch)
-    return sorted(epochs)
+    return sorted(int(epoch) for epoch in ROOT.epochs.keys(_db()))
 
 
 def build_pairwise_prompt(side_a: dict, side_b: dict) -> str:
@@ -1337,12 +1751,34 @@ def _replayed_discovery_state(events: list) -> tuple[set[str], dict[str, str]]:
     return seen_oids, seen_patches
 
 
-def _build_discovery(epoch_n: int, boundary_ms: int, events: list) -> GitDiscovery:
+def _build_discovery(
+    epoch_n: int, boundary_ms: int, events: list | None = None
+) -> GitDiscovery:
     config = _normalized_discovery_config()
     digest = _config_digest(config)
-    prior_discoveries = [e for e in events if isinstance(e, GitDiscovery)]
-    initial = not prior_discoveries
-    seen_oids, seen_patches = _replayed_discovery_state(events)
+    if events is None:
+        db = _db()
+        initial = ROOT.latest_discovery.get(db) is None
+        pending_patches: dict[str, str] = {}
+
+        def oid_seen(oid: str) -> bool:
+            return ROOT.seen_git_oids.contains(db, oid)
+
+        def canonical_patch(patch_identity: str) -> str | None:
+            return (
+                pending_patches.get(patch_identity)
+                or ROOT.canonical_patch_oids.key(patch_identity).get(db)
+            )
+    else:
+        prior_discoveries = [e for e in events if isinstance(e, GitDiscovery)]
+        initial = not prior_discoveries
+        seen_oids, seen_patches = _replayed_discovery_state(events)
+
+        def oid_seen(oid: str) -> bool:
+            return oid in seen_oids
+
+        def canonical_patch(patch_identity: str) -> str | None:
+            return seen_patches.get(patch_identity)
     email_to_contributor = {
         email: contributor
         for contributor, emails in config["contributors"].items()
@@ -1377,7 +1813,7 @@ def _build_discovery(epoch_n: int, boundary_ms: int, events: list) -> GitDiscove
             ).hexdigest(),
         })
 
-    new_oids = sorted(set(locations) - seen_oids)
+    new_oids = sorted(oid for oid in locations if not oid_seen(oid))
     pending = []
     for qualified_oid in new_oids:
         source_rows = sorted({
@@ -1434,12 +1870,16 @@ def _build_discovery(epoch_n: int, boundary_ms: int, events: list) -> GitDiscove
         patch_identity = commit["patch_identity"]
         duplicate_patch = False
         if patch_identity:
-            if patch_identity in seen_patches:
-                canonical_patch_oid = seen_patches[patch_identity]
+            prior_canonical = canonical_patch(patch_identity)
+            if prior_canonical:
+                canonical_patch_oid = prior_canonical
                 duplicate_patch = True
             else:
                 canonical_patch_oid = commit["oid"]
-                seen_patches[patch_identity] = canonical_patch_oid
+                if events is None:
+                    pending_patches[patch_identity] = canonical_patch_oid
+                else:
+                    seen_patches[patch_identity] = canonical_patch_oid
 
         if initial and commit["committer_timestamp_ms"] < GENESIS_MS:
             reason = "before_genesis"
@@ -1558,34 +1998,22 @@ async def discover_repositories(epoch_n: int, boundary_ms: int) -> GitDiscovery:
     async with _DISCOVERY_LOCK:
         lock_file = await asyncio.to_thread(_acquire_discovery_file_lock)
         try:
-            events = store.read()
-            existing = next(
-                (
-                    e for e in events
-                    if isinstance(e, GitDiscovery) and e.epoch == epoch_n
-                ),
-                None,
-            )
+            existing = _discovery_for_epoch(epoch_n)
             if existing:
                 await _persist_discovery_evidence(existing)
                 return existing
             candidate = await asyncio.to_thread(
-                _build_discovery, epoch_n, boundary_ms, events
+                _build_discovery, epoch_n, boundary_ms
             )
-
-            def append_if_new(current_events):
-                if any(
-                    isinstance(e, GitDiscovery) and e.epoch == epoch_n
-                    for e in current_events
-                ):
-                    return None
-                return candidate
-
-            appended = await store.atomic(append_if_new)
-            discovery = appended or next(
-                e for e in store.read()
-                if isinstance(e, GitDiscovery) and e.epoch == epoch_n
-            )
+            async with _LEDGER_LOCK:
+                discovery = _discovery_for_epoch(epoch_n)
+                if discovery is None:
+                    stored_row, blobs = _externalize_payload(to_dict(candidate))
+                    _db().apply(
+                        _event_writes(stored_row, blobs=blobs),
+                        Durability.SYNC_WAL,
+                    )
+                    discovery = candidate
             await _persist_discovery_evidence(discovery)
             return discovery
         finally:
@@ -1677,7 +2105,9 @@ def _rollup_contributor_scores(
 
 
 def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
-    for e in evidence_by_kind("llm.judgment"):
+    path = ROOT.judgment_ids_by_comparison.key(comparison_id)
+    ids = path.iter(_db()) if path.len(_db()) else []
+    for e in _evidence_from_ids(ids):
         p = e.payload
         if p.get("comparison_id") == comparison_id and p.get("model_id") == model_id:
             return p
@@ -1685,11 +2115,13 @@ def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
 
 
 def _find_ranking_models(ranking_run_id: str) -> list[str] | None:
-    for e in evidence_by_kind("ranking.started"):
-        if e.payload.get("ranking_run_id") == ranking_run_id:
-            models = e.payload.get("models")
-            if isinstance(models, list) and models:
-                return [str(m) for m in models]
+    event_ = find_evidence_payload(
+        "ranking.started", "ranking_run_id", ranking_run_id
+    )
+    if event_:
+        models = event_.payload.get("models")
+        if isinstance(models, list) and models:
+            return [str(m) for m in models]
     return None
 
 
@@ -2002,8 +2434,13 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
 
 DECAY_RATE = 1 - (Decimal("0.5").ln() / (HALF_LIFE_YEARS * 12)).exp()
 
-def pool_remaining(events: list) -> Decimal:
-    emitted = sum(Decimal(e.total_emitted) for e in events if isinstance(e, Emission))
+def pool_remaining(events: list | None = None) -> Decimal:
+    if events is None:
+        emitted = Decimal(ROOT.meta.total_emitted.get(_db()) or "0")
+    else:
+        emitted = sum(
+            Decimal(e.total_emitted) for e in events if isinstance(e, Emission)
+        )
     return CONTRIBUTOR_POOL - emitted
 
 
@@ -2058,10 +2495,11 @@ async def run_emission(epoch_n, boundary_ms):
     else:
         ranking, models, ranking_info = ranked
 
-    def make_emission(events):
-        if epoch_n in {e.epoch for e in events if isinstance(e, Emission)}:
-            return None
-        pool_now = pool_remaining(events)
+    async with _LEDGER_LOCK:
+        existing = _emission_for_epoch(epoch_n)
+        if existing:
+            return existing
+        pool_now = pool_remaining()
         emission_now = pool_now * DECAY_RATE if ranking else Decimal("0")
         normalized_ranking = {}
         distributions = {}
@@ -2078,7 +2516,7 @@ async def run_emission(epoch_n, boundary_ms):
                 distributions[contributor] = amount
                 allocated += amount
             distributions[contributors[-1]] = emission_now - allocated
-        return Emission(
+        entry = Emission(
             epoch=epoch_n,
             timestamp_ms=boundary_ms,
             discovery_snapshot_id=discovery.snapshot_id,
@@ -2093,8 +2531,7 @@ async def run_emission(epoch_n, boundary_ms):
             ranking_run_id=ranking_info.get("ranking_run_id", ""),
             ranking_event_id=ranking_info.get("ranking_event_id", ""),
         )
-
-    entry = await store.atomic(make_emission)
+        _db().apply(_event_writes(to_dict(entry)), Durability.SYNC_WAL)
     if entry:
         PROCESS_STATE["running"] = False
         await broadcast_audit(
@@ -2135,7 +2572,7 @@ async def distribute_usdc(holdings, treasury_balance):
         treasury_balance=str(treasury_balance),
         distributions={w: str(treasury_balance * b / total) for w, b in holdings.items()},
     )
-    await store.append(entry)
+    await _append_typed_event(entry)
     return entry
 
 
@@ -2146,8 +2583,7 @@ async def distribute_usdc(holdings, treasury_balance):
 async def epoch_loop():
     while True:
         epoch_n, current_start, next_boundary = current_epoch()
-        processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
-        if epoch_n >= 0 and epoch_n not in processed:
+        if epoch_n >= 0 and not ROOT.emissions_by_epoch.contains(_db(), epoch_n):
             try:
                 await run_emission(epoch_n, current_start)
             except Exception as exc:
@@ -2238,7 +2674,12 @@ async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
     """List of ledger dicts. Heavy blobs stripped unless full=1."""
     limit = max(1, min(limit, 500))
     rows = []
-    for e in store.read()[offset:offset + limit]:
+    db = _db()
+    total = ROOT.events.len(db)
+    for index in range(max(0, offset), min(total, max(0, offset) + limit)):
+        e = _typed(ROOT.events.get(db, index))
+        if e is None:
+            continue
         if isinstance(e, Evidence) and not full:
             rows.append(_evidence_summary(e))
         else:
@@ -2249,33 +2690,33 @@ async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
 
 @app.middleware("http")
 async def ledger_ready_gate(request: Request, call_next):
-    if request.url.path == "/api/health":
-        return await call_next(request)
-    if isinstance(store, DeferredJsonlStore) and not store.ready:
-        return JSONResponse(
-            {
-                "ok": False,
-                "loading": True,
-                "message": "replaying ledger into memory",
-            },
-            status_code=503,
-        )
     return await call_next(request)
 
 
 @app.get("/api/health")
 async def get_health():
-    """Liveness only — must not touch the ledger (boot + ranking)."""
+    """Report readiness using only the exact list-length metadata key."""
+    error = STATE_STATUS["error"]
+    event_count = STATE_STATUS["event_count"]
+    if STATE_STATUS["ready"] and state_db is not None:
+        try:
+            event_count = ROOT.events.len(state_db)
+        except Exception as exc:
+            error = str(exc)
+    ready = bool(STATE_STATUS["ready"] and not error)
     return {
-        "ok": True,
-        "ledger_ready": bool(getattr(store, "ready", True)),
+        "ok": ready,
+        "ledger_ready": ready,
+        "importing": bool(STATE_STATUS["importing"]),
+        "error": error,
+        "event_count": event_count,
     }
 
 
 @app.get("/api/epoch")
 async def get_epoch():
     epoch_n, start, next_b = current_epoch()
-    pool = pool_remaining(store.read())
+    pool = pool_remaining()
     return {
         "epoch": epoch_n, "start_ms": start, "next_boundary_ms": next_b,
         "total_supply": str(TOTAL_SUPPLY),
@@ -2291,18 +2732,16 @@ async def get_epoch():
 
 @app.get("/api/ranking")
 async def get_ranking():
-    emissions = [e for e in store.read() if isinstance(e, Emission)]
-    if not emissions:
+    latest = _typed(ROOT.latest_emission.get(_db()))
+    if not isinstance(latest, Emission):
         return {"ranking": {}, "epoch": -1}
-    latest = emissions[-1]
     return {"ranking": latest.ranking, "epoch": latest.epoch}
 
 
 @app.get("/api/status")
 async def get_status():
-    events = store.read()
-    discoveries = [e for e in events if isinstance(e, GitDiscovery)]
-    emissions = [e for e in events if isinstance(e, Emission)]
+    latest_discovery = _typed(ROOT.latest_discovery.get(_db()))
+    latest_emission = _typed(ROOT.latest_emission.get(_db()))
     return {
         **PROCESS_STATE,
         "epoch": current_epoch()[0],
@@ -2310,29 +2749,32 @@ async def get_status():
         "sse_clients": len(SSE_CLIENTS),
         "latest_discovery": (
             {
-                "epoch": discoveries[-1].epoch,
-                "snapshot_id": discoveries[-1].snapshot_id,
-                "observations": len(discoveries[-1].observations),
-                "eligible_commits": len(discoveries[-1].commits),
+                "epoch": latest_discovery.epoch,
+                "snapshot_id": latest_discovery.snapshot_id,
+                "observations": len(latest_discovery.observations),
+                "eligible_commits": len(latest_discovery.commits),
             }
-            if discoveries else None
+            if isinstance(latest_discovery, GitDiscovery) else None
         ),
         "latest_emission": (
             {
-                "epoch": emissions[-1].epoch,
-                "total_emitted": emissions[-1].total_emitted,
-                "ranking": emissions[-1].ranking,
+                "epoch": latest_emission.epoch,
+                "total_emitted": latest_emission.total_emitted,
+                "ranking": latest_emission.ranking,
             }
-            if emissions else None
+            if isinstance(latest_emission, Emission) else None
         ),
     }
 
 
 @app.get("/api/contributor/{github_username}")
 async def get_contributor(github_username: str):
+    emissions = [
+        _typed(row) for _, row in ROOT.emissions_by_epoch.iter(_db())
+    ]
     history = [
         {"epoch": e.epoch, "amount": e.distributions[github_username], "rank_score": e.ranking.get(github_username)}
-        for e in store.read()
+        for e in emissions
         if isinstance(e, Emission) and github_username in e.distributions
     ]
     return {"contributor": github_username, "total_earned": str(sum(Decimal(h["amount"]) for h in history)), "history": history}
@@ -2381,7 +2823,7 @@ async def test_emit():
     """Integration tests only: run the next unprocessed emission."""
     if os.environ.get("ALLOW_TEST_TRIGGERS") != "1":
         return Response(status_code=404)
-    processed = {e.epoch for e in store.read() if isinstance(e, Emission)}
+    processed = set(int(epoch) for epoch in ROOT.emission_epochs.keys(_db()))
     n = 0
     while n in processed:
         n += 1
@@ -2461,7 +2903,14 @@ def _side_label(side: dict) -> str:
 def _judgments_by_comparison(
     judgments: list[Evidence] | None = None,
 ) -> dict[str, list[Evidence]]:
-    rows = judgments if judgments is not None else evidence_by_kind("llm.judgment")
+    if judgments is None:
+        out: dict[str, list[Evidence]] = {}
+        for comparison_id in ROOT.judgment_ids_by_comparison.keys(_db()):
+            out[str(comparison_id)] = _judgments_for_comparison(
+                str(comparison_id)
+            )
+        return out
+    rows = judgments
     out: dict[str, list[Evidence]] = {}
     for e in rows:
         cid = e.payload.get("comparison_id")
@@ -2471,7 +2920,9 @@ def _judgments_by_comparison(
 
 
 def _judgments_for_comparison(comparison_id: str) -> list[Evidence]:
-    return _judgments_by_comparison().get(comparison_id, [])
+    path = ROOT.judgment_ids_by_comparison.key(comparison_id)
+    ids = path.iter(_db()) if path.len(_db()) else []
+    return _evidence_from_ids(ids)
 
 
 def _judgment_blocks(judgments: list[Evidence]) -> list:
@@ -2549,14 +3000,11 @@ async def epochs_index():
     rows = []
     for epoch in epochs:
         emission = _emission_for_epoch(epoch)
-        evidence_n = sum(1 for e in evidence_by_kind() if e.epoch == epoch)
-        disc = next(
-            (
-                e for e in evidence_by_kind("git.discovery_completed")
-                if e.epoch == epoch
-            ),
-            None,
+        evidence_n = int(
+            ROOT.evidence_count_by_epoch.key(epoch).get(_db())
         )
+        discovery_event_id = ROOT.discovery_evidence_by_epoch.key(epoch).get(_db())
+        disc = find_evidence(discovery_event_id) if discovery_event_id else None
         detail = []
         if disc:
             detail.append(
@@ -2584,7 +3032,7 @@ async def epochs_index():
 @app.get("/epochs/{epoch}")
 async def epoch_detail(epoch: int):
     emission = _emission_for_epoch(epoch)
-    evidence_rows = [e for e in evidence_by_kind() if e.epoch == epoch]
+    evidence_rows = _evidence_for_epoch(epoch)
     if not evidence_rows and emission is None:
         return _evidence_page(f"epoch {epoch}", [
             _evidence_nav(),
@@ -2807,10 +3255,16 @@ async def commit_detail(commit_id: str):
         ])
     p = ev.payload
     epoch = ev.epoch
-    judgments_by_cmp = _judgments_by_comparison()
     related_cmp = []
-    for cmp in evidence_by_kind("comparison.input"):
-        if cmp.epoch != epoch:
+    comparison_path = ROOT.comparison_ids_by_commit.key(commit_id)
+    comparison_ids = (
+        comparison_path.iter(_db()) if comparison_path.len(_db()) else []
+    )
+    for comparison_id in comparison_ids:
+        cmp = find_evidence_payload(
+            "comparison.input", "comparison_id", comparison_id
+        )
+        if not cmp:
             continue
         sa, sb = cmp.payload.get("side_a") or {}, cmp.payload.get("side_b") or {}
         ids = {
@@ -2821,7 +3275,7 @@ async def commit_detail(commit_id: str):
         }
         if commit_id not in ids:
             continue
-        cid = cmp.payload.get("comparison_id")
+        cid = comparison_id
         if not cid:
             continue
         related_cmp.append(["article.dense-card",
@@ -2832,7 +3286,7 @@ async def commit_detail(commit_id: str):
                 " vs ",
                 _side_label(sb),
             ],
-            *_judgment_blocks(judgments_by_cmp.get(cid, [])),
+            *_judgment_blocks(_judgments_for_comparison(cid)),
         ])
     return _evidence_page(f"commit {commit_id[:24]}", [
         _evidence_nav(_a(_evidence_path("epoch", str(epoch)), f"epoch {epoch}")),
@@ -2885,14 +3339,19 @@ async def comparison_detail(comparison_id: str):
     side_b = p.get("side_b") or {}
     judgments = _judgments_for_comparison(comparison_id)
     attempt_links = []
-    for a in evidence_by_kind("llm.attempt_started"):
-        if a.payload.get("comparison_id") == comparison_id:
-            aid = a.payload.get("attempt_id")
-            if aid:
-                attempt_links.append((
-                    f"{a.payload.get('model_id')} #{a.payload.get('attempt_number')}",
-                    _evidence_path("attempt", aid),
-                ))
+    attempt_path = ROOT.attempt_ids_by_comparison.key(comparison_id)
+    attempt_event_ids = (
+        attempt_path.iter(_db()) if attempt_path.len(_db()) else []
+    )
+    for a in _evidence_from_ids(attempt_event_ids):
+        if a.kind != "llm.attempt_started":
+            continue
+        aid = a.payload.get("attempt_id")
+        if aid:
+            attempt_links.append((
+                f"{a.payload.get('model_id')} #{a.payload.get('attempt_number')}",
+                _evidence_path("attempt", aid),
+            ))
     judgment_links = [
         (
             j.payload.get("summary") or j.payload.get("judgment_id", j.event_id),
@@ -2977,11 +3436,8 @@ async def attempt_detail(attempt_id: str):
     base = started or finished
     assert base is not None
     p = {**(started.payload if started else {}), **(finished.payload if finished else {})}
-    judgment = None
-    for j in evidence_by_kind("llm.judgment"):
-        if j.payload.get("attempt_id") == attempt_id:
-            judgment = j
-            break
+    judgment_event_id = ROOT.judgment_id_by_attempt.key(attempt_id).get(_db())
+    judgment = find_evidence(judgment_event_id) if judgment_event_id else None
     comparison_id = p.get("comparison_id")
     return _evidence_page(f"attempt {attempt_id[:24]}", [
         _evidence_nav(
@@ -3441,9 +3897,14 @@ table.dense td.msg { color: var(--prose); font-family: var(--font-prose); }
 
 
 def _watch_initial_state() -> dict:
-    events = store.read()
+    db = _db()
+    total = ROOT.events.len(db)
+    events = [
+        _typed(ROOT.events.get(db, index))
+        for index in range(max(0, total - 40), total)
+    ]
     feed = []
-    for event_ in events[-40:]:
+    for event_ in events:
         if isinstance(event_, GitDiscovery):
             feed.append({
                 "id": f"discovery-{event_.snapshot_id}",
@@ -3657,7 +4118,7 @@ async def watch():
 
 
 async def redeem(github_user: str, wallet_address: str):
-    await store.append(Redemption(
+    await _append_typed_event(Redemption(
         timestamp_ms=int(time.time() * 1000),
         github_user=github_user,
         wallet_address=wallet_address,
@@ -3683,11 +4144,18 @@ async def index(request: Request):
             ],
         ])
 
-    events = store.read()
-    history = [e for e in events if isinstance(e, Emission) and user in e.distributions]
+    emissions = [
+        _typed(row) for _, row in ROOT.emissions_by_epoch.iter(_db())
+    ]
+    history = [
+        e for e in emissions
+        if isinstance(e, Emission) and user in e.distributions
+    ]
     total_earned = sum(Decimal(e.distributions[user]) for e in history)
-    emissions = [e for e in events if isinstance(e, Emission)]
-    latest_rank = emissions[-1].ranking.get(user) if emissions else None
+    latest = _typed(ROOT.latest_emission.get(_db()))
+    latest_rank = (
+        latest.ranking.get(user) if isinstance(latest, Emission) else None
+    )
 
     redeem_form = ["form", {"method": "post"},
         *signer.snippet_hidden(f"redeem({json.dumps(user)}, $wallet_address)"),
@@ -3758,17 +4226,10 @@ async def callback(request: Request, code: str):
 
 @app.on_event("startup")
 async def startup():
-    async def boot():
-        if isinstance(store, DeferredJsonlStore) and not store.ready:
-            print("replaying ledger…", flush=True)
-            await asyncio.to_thread(store.load_sync)
-            n = len(store.read())
-            print(f"ledger ready: {n} events", flush=True)
-        if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
-            asyncio.create_task(epoch_loop())
-
-    # Do not block bind/health on ledger replay.
-    asyncio.create_task(boot())
+    status = await asyncio.to_thread(prepare_state_sync)
+    print(f"rocks ledger ready: {status['event_count']} events", flush=True)
+    if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
+        asyncio.create_task(epoch_loop())
 
 
 if __name__ == "__main__":

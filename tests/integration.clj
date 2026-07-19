@@ -312,7 +312,7 @@
                            "SLUG_SOCIAL_BASE_URL" slug-live-base
                            "SLUG_MODEL_RANK_PARENT" slug-model-parent
                            "OPENROUTER_API_KEY" ""}))
-      (bind py @(p/process ["uv" "run" "python" "-c"
+      (bind py @(p/process [(str root "/.venv/bin/python") "-c"
                             (str "import asyncio, json, os\n"
                                  "os.environ.setdefault('SESSION_SECRET','x')\n"
                                  "os.environ.setdefault('GENESIS_MS','1')\n"
@@ -372,6 +372,7 @@
   (letlocals
     (bind tmp-dir      (str (fs/create-temp-dir {:prefix "constitution-test-"})))
     (bind jsonl-path   (str tmp-dir "/ledger.jsonl"))
+    (bind rocks-path   (str tmp-dir "/ledger.rocks"))
     (bind server-port  (pick-port))
     (bind or-port      (pick-port))  ; openrouter mock
     (bind base-url     (str "http://127.0.0.1:" server-port))
@@ -380,6 +381,7 @@
     (bind genesis-ms   (str (- (System/currentTimeMillis) (* 35 24 60 60 1000))))
 
     (bind root          (project-root))
+    (bind python-bin    (str root "/.venv/bin/python"))
     (test-live-slug-model-council! root)
     (bind repo-a (make-git-repository! tmp-dir "repo-a" "alice"
                                        "alice@example.test" "alice.txt"))
@@ -396,6 +398,7 @@
       {"SESSION_SECRET"       "test-secret"
        "GENESIS_MS"           genesis-ms
        "JSONL_PATH"           jsonl-path
+       "ROCKS_PATH"           rocks-path
        "GIT_MIRROR_DIR"       (str tmp-dir "/mirrors")
        "REPOSITORIES_JSON"    repositories-json
        "CONTRIBUTORS_JSON"    contributors-json
@@ -427,10 +430,14 @@
         ;; 2. seed ledger so pool_remaining has history to read
         (seed-ledger jsonl-path)
         (assert! (fs/exists? jsonl-path) "ledger.jsonl seeded")
+        (command! [python-bin (str root "/scripts/import-ledger.py")
+                   jsonl-path rocks-path]
+                  {:dir root :env server-env})
+        (assert! (fs/exists? rocks-path) "Rocks projection imported")
 
         ;; 3. start constitution server
         (println (str "\nstarting server on :" server-port " (data: " tmp-dir ")"))
-        (bind server (p/process ["uv" "run" "constitution.py"]
+        (bind server (p/process [python-bin "constitution.py"]
                                 {:out :inherit :err :inherit :env server-env
                                  :dir root}))
         (reset! !server server)
@@ -566,8 +573,8 @@
         (deref server)
         (reset! !server nil)
 
-        (println "restarting server from same JSONL…")
-        (bind server2 (p/process ["uv" "run" "constitution.py"]
+        (println "restarting server from same Rocks projection…")
+        (bind server2 (p/process [python-bin "constitution.py"]
                                  {:out :inherit :err :inherit :env server-env
                                   :dir root}))
         (reset! !server2 server2)

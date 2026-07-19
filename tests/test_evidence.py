@@ -14,9 +14,11 @@ import constitution as c
 
 @pytest.fixture
 def evidence_store(tmp_path, monkeypatch):
-    monkeypatch.setattr(c, "store", c.JsonlStore(tmp_path / "ledger.jsonl"))
+    db = c.RocksDb.open(tmp_path / "ledger.rocks")
+    monkeypatch.setattr(c, "state_db", db)
     monkeypatch.setattr(c, "PUBLIC_BASE_URL", "http://test.local")
-    return tmp_path
+    yield tmp_path
+    db.close()
 
 
 def test_bytes_blob_roundtrip_crlf_nul_invalid_utf8():
@@ -41,7 +43,8 @@ def test_append_evidence_is_idempotent_and_hash_chained(evidence_store):
         "summary": "done", "snapshot_id": "abc",
     }))
     assert second.previous_event_sha256 == first.event_id.split("_", 1)[-1]
-    events = [e for e in c.store.read() if isinstance(e, c.Evidence)]
+    ids = c.ROOT.event_ids_by_epoch.key(1).iter(c._db())
+    events = c._evidence_from_ids(ids)
     assert len(events) == 2
 
 
@@ -234,7 +237,7 @@ def test_ranking_resume_skips_duplicate_provider_calls(evidence_store, monkeypat
 
 
 def test_epochs_index_lists_epochs(evidence_store):
-    asyncio.run(c.store.append(c.Emission(
+    asyncio.run(c._append_typed_event(c.Emission(
         epoch=3,
         timestamp_ms=1,
         pool_before="1",

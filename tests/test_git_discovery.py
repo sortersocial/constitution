@@ -90,13 +90,16 @@ def push(work: Path, *refs: str) -> None:
 
 @pytest.fixture
 def discovery_config(tmp_path, monkeypatch):
+    db = c.RocksDb.open(tmp_path / "ledger.rocks")
+    monkeypatch.setattr(c, "state_db", db)
     monkeypatch.setattr(c, "GIT_MIRROR_DIR", tmp_path / "mirrors")
     monkeypatch.setattr(c, "GENESIS_MS", 1_000_000)
     monkeypatch.setattr(c, "CONTRIBUTORS", {
         "alice": ["author@example.test"],
         "bob": ["bob@example.test"],
     })
-    return tmp_path
+    yield tmp_path
+    db.close()
 
 
 def configure(monkeypatch, repositories):
@@ -370,9 +373,6 @@ def test_concurrent_same_epoch_discovery_appends_once(
     configure(monkeypatch, [{
         "id": "one", "url": str(remote), "refs": ["refs/heads/main"],
     }])
-    ledger_path = discovery_config / "ledger.jsonl"
-    monkeypatch.setattr(c, "store", c.JsonlStore(ledger_path))
-
     async def run_both():
         return await asyncio.gather(
             c.discover_repositories(0, c.GENESIS_MS),
@@ -382,7 +382,7 @@ def test_concurrent_same_epoch_discovery_appends_once(
     left, right = asyncio.run(run_both())
     assert left.snapshot_id == right.snapshot_id
     discoveries = [
-        event for event in c.store.read() if isinstance(event, c.GitDiscovery)
+        c._typed(row) for _, row in c.ROOT.discoveries_by_epoch.iter(c._db())
     ]
     assert len(discoveries) == 1
 
@@ -390,8 +390,6 @@ def test_concurrent_same_epoch_discovery_appends_once(
 def test_empty_epoch_records_zero_emission_without_burning_pool(
     discovery_config, monkeypatch
 ):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
-
     async def discover(_epoch, _boundary):
         return SimpleNamespace(
             observations=[], commits=[], snapshot_id="empty-snapshot"
@@ -411,8 +409,6 @@ def test_empty_epoch_records_zero_emission_without_burning_pool(
 def test_emission_distribution_sums_exactly_to_total(
     discovery_config, monkeypatch
 ):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
-
     async def discover(_epoch, _boundary):
         return SimpleNamespace(
             observations=[{"x": 1}],
@@ -437,8 +433,6 @@ def test_emission_distribution_sums_exactly_to_total(
 def test_single_commit_ranking_skips_pairwise(
     discovery_config, monkeypatch,
 ):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
-
     async def models(n=3):
         return []
 
@@ -457,7 +451,6 @@ def test_single_commit_ranking_skips_pairwise(
 def test_same_contributor_multiple_commits_runs_pairwise(
     discovery_config, monkeypatch,
 ):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
     monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
     calls = {"n": 0}
 
@@ -505,17 +498,13 @@ def test_same_contributor_multiple_commits_runs_pairwise(
     assert ranking["alice"] > 0
     assert used == ["m1", "m2", "m3"]
     assert calls["n"] >= 3
-    completed = next(
-        e for e in c.store.read()
-        if isinstance(e, c.Evidence) and e.kind == "ranking.completed"
-    )
+    completed = c._evidence_for_kind("ranking.completed")[0]
     assert len(completed.payload["commit_ranking"]) == 3
     assert "alice" in completed.payload["contributor_ranking"]
     assert info["ranking_event_id"]
 
 
 def test_all_council_failures_abort_ranking(discovery_config, monkeypatch):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
     monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
 
     async def models(n=3):
@@ -541,7 +530,6 @@ def test_all_council_failures_abort_ranking(discovery_config, monkeypatch):
 
 
 def test_one_council_failure_retires_model_and_continues(discovery_config, monkeypatch):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
     monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
 
     async def models(n=3):
@@ -586,16 +574,10 @@ def test_one_council_failure_retires_model_and_continues(discovery_config, monke
     ranking, used, _info = asyncio.run(c.rank_commits(commits, epoch=0))
     assert set(ranking) == {"alice", "bob"}
     assert used == ["solid"]
-    retired = [
-        e for e in c.store.read()
-        if isinstance(e, c.Evidence) and e.kind == "llm.council_member_failed"
-    ]
+    retired = c._evidence_for_kind("llm.council_member_failed")
     assert len(retired) == 1
     assert retired[0].payload["model_id"] == "broken"
-    completed = next(
-        e for e in c.store.read()
-        if isinstance(e, c.Evidence) and e.kind == "ranking.completed"
-    )
+    completed = c._evidence_for_kind("ranking.completed")[0]
     assert completed.payload["models_failed"] == ["broken"]
 
 
@@ -617,7 +599,6 @@ def test_multi_commit_ranking_requires_openrouter_key(monkeypatch):
 def test_watch_page_has_live_controls_progress_and_key_warning(
     discovery_config, monkeypatch
 ):
-    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
     monkeypatch.setattr(c, "OPENROUTER_API_KEY", "")
     monkeypatch.setattr(c, "current_epoch", lambda: (3, 0, 1))
     response = asyncio.run(c.watch())

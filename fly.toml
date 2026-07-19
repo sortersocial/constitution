@@ -7,6 +7,7 @@ primary_region = "ord"
 [env]
   GENESIS_MS = "1775364391260"
   JSONL_PATH = "/data/ledger.jsonl"
+  ROCKS_PATH = "/data/constitution.rocks"
   GIT_MIRROR_DIR = "/data/git"
   PORT = "8080"
 

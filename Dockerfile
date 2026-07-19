@@ -9,6 +9,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 COPY constitution.py ./
+COPY scripts/import-ledger.py ./scripts/import-ledger.py
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED="1"
