@@ -113,21 +113,31 @@ blob values.
 ## Rebuilding a flawed projection
 
 The first-boot importer intentionally skips a nonempty database, so it cannot
-repair an older projection containing embedded base64. During maintenance,
-with the application fully stopped and `DISABLE_EPOCH_LOOP=1`:
+repair an older projection containing embedded base64. For this one migration,
+start the corrected image with both maintenance flags:
 
 ```sh
-mv /data/constitution.rocks /data/constitution.rocks.pre-blob-refs
-python scripts/import-ledger.py \
-  /data/ledger.jsonl \
-  /data/constitution.rocks \
-  --batch-size 100
+DISABLE_EPOCH_LOOP=1
+REBUILD_ROCKS_FROM_JSONL=1
 ```
 
-Do not use `--force` here: retaining the closed old directory makes rollback
-immediate. Start the application still paused, verify health count/chain and
-representative epoch, comparison, commit, patch, prompt, and attempt routes,
-then unpause. If import or verification fails, stop, remove the incomplete new
-directory if present, move `.pre-blob-refs` back to
-`/data/constitution.rocks`, and restart the prior image while remaining
-paused.
+Use a non-overlapping deployment strategy so the prior process releases
+RocksDB first. Before opening its live handle, startup requires the tape,
+verifies and closes a probe of the nonempty projection, refuses to proceed if
+`/data/constitution.rocks.pre-rebuild` already exists, then atomically renames
+the old directory to that exact backup path. It imports and verifies a fresh
+`/data/constitution.rocks`. On failure it destroys the partial fresh directory
+and renames the backup back automatically. On success it serves from the new
+projection and deliberately retains the backup.
+
+While still paused, verify the health count and representative epoch,
+comparison, commit, patch, prompt, and attempt routes. Then remove
+`REBUILD_ROCKS_FROM_JSONL` before any restart or second deployment; leaving it
+enabled will correctly fail startup because the deterministic backup exists.
+Restart once with only `DISABLE_EPOCH_LOOP=1`, verify again, and only then
+unpause. Delete `.pre-rebuild` manually only after the verification window.
+
+For rollback after a successful rebuild, stop the process, move the fresh
+directory aside, rename `.pre-rebuild` back to `/data/constitution.rocks`, and
+start the prior image while still paused. The rebuild flag is exact and
+inactive for every value except `1`.

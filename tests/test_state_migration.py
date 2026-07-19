@@ -349,6 +349,7 @@ def _configure_first_boot(monkeypatch, tape, rocks):
     monkeypatch.setattr(c, "ROCKS_PATH", rocks)
     monkeypatch.setattr(c, "state_db", None)
     monkeypatch.setenv("IMPORT_JSONL_ON_EMPTY", "1")
+    monkeypatch.delenv("REBUILD_ROCKS_FROM_JSONL", raising=False)
     c.STATE_STATUS.update(
         ready=False, importing=False, error=None, event_count=0
     )
@@ -471,3 +472,124 @@ def test_import_rejects_duplicate_unique_events(tmp_path, duplicate_type):
         assert c.ROOT.events.len(db) == 0
     finally:
         db.destroy()
+
+
+def _seed_flawed_projection(path):
+    db = c.RocksDb.open(path)
+    db.apply([
+        c.ROOT.events.push({"type": "redemption", "timestamp_ms": 9}),
+    ])
+    db.close()
+
+
+def _configure_rebuild(monkeypatch, tape, rocks):
+    monkeypatch.setattr(c, "JSONL_PATH", tape)
+    monkeypatch.setattr(c, "ROCKS_PATH", rocks)
+    monkeypatch.setattr(c, "state_db", None)
+    monkeypatch.setenv("REBUILD_ROCKS_FROM_JSONL", "1")
+    monkeypatch.delenv("IMPORT_JSONL_ON_EMPTY", raising=False)
+    c.STATE_STATUS.update(
+        ready=False, importing=False, error=None, event_count=0
+    )
+
+
+def test_startup_rebuild_retains_backup_and_opens_verified_projection(
+    tmp_path, monkeypatch
+):
+    tape = tmp_path / "ledger.jsonl"
+    rocks = tmp_path / "constitution.rocks"
+    backup = tmp_path / "constitution.rocks.pre-rebuild"
+    rows, _ = _sample_tape(tape)
+    _seed_flawed_projection(rocks)
+    _configure_rebuild(monkeypatch, tape, rocks)
+
+    status = c.prepare_state_sync()
+    try:
+        assert status["ready"] is True
+        assert status["event_count"] == len(rows)
+        assert backup.is_dir()
+        old = c.RocksDb.open(backup)
+        try:
+            assert c.ROOT.events.len(old) == 1
+            assert c.ROOT.events.get(old, 0)["timestamp_ms"] == 9
+        finally:
+            old.close()
+    finally:
+        c.state_db.close()
+        c.state_db = None
+
+
+def test_startup_rebuild_refuses_existing_backup_without_mutation(
+    tmp_path, monkeypatch
+):
+    tape = tmp_path / "ledger.jsonl"
+    rocks = tmp_path / "constitution.rocks"
+    backup = tmp_path / "constitution.rocks.pre-rebuild"
+    _sample_tape(tape)
+    _seed_flawed_projection(rocks)
+    backup.mkdir()
+    _configure_rebuild(monkeypatch, tape, rocks)
+
+    with pytest.raises(RuntimeError, match="backup already exists"):
+        c.prepare_state_sync()
+    original = c.RocksDb.open(rocks)
+    try:
+        assert c.ROOT.events.len(original) == 1
+        assert c.ROOT.events.get(original, 0)["timestamp_ms"] == 9
+    finally:
+        original.close()
+
+
+def test_startup_rebuild_failure_removes_partial_and_restores_backup(
+    tmp_path, monkeypatch
+):
+    tape = tmp_path / "ledger.jsonl"
+    rocks = tmp_path / "constitution.rocks"
+    backup = tmp_path / "constitution.rocks.pre-rebuild"
+    _sample_tape(tape)
+    _seed_flawed_projection(rocks)
+    _configure_rebuild(monkeypatch, tape, rocks)
+
+    def fail_after_partial_write(_tape, target):
+        partial = c.RocksDb.open(target)
+        partial.apply([
+            c.ROOT.events.push({"type": "redemption", "timestamp_ms": 99}),
+        ])
+        partial.close()
+        raise RuntimeError("injected import failure")
+
+    monkeypatch.setattr(c, "import_jsonl_tape", fail_after_partial_write)
+    with pytest.raises(RuntimeError, match="injected import failure"):
+        c.prepare_state_sync()
+
+    assert not backup.exists()
+    restored = c.RocksDb.open(rocks)
+    try:
+        assert c.ROOT.events.len(restored) == 1
+        assert c.ROOT.events.get(restored, 0)["timestamp_ms"] == 9
+    finally:
+        restored.close()
+    assert c.state_db is None
+    assert c.STATE_STATUS["ready"] is False
+    assert c.STATE_STATUS["importing"] is False
+
+
+def test_startup_rebuild_requires_exact_flag_value(tmp_path, monkeypatch):
+    tape = tmp_path / "ledger.jsonl"
+    rocks = tmp_path / "constitution.rocks"
+    backup = tmp_path / "constitution.rocks.pre-rebuild"
+    _sample_tape(tape)
+    _seed_flawed_projection(rocks)
+    monkeypatch.setattr(c, "JSONL_PATH", tape)
+    monkeypatch.setattr(c, "ROCKS_PATH", rocks)
+    monkeypatch.setattr(c, "state_db", None)
+    monkeypatch.setenv("REBUILD_ROCKS_FROM_JSONL", "true")
+    monkeypatch.delenv("IMPORT_JSONL_ON_EMPTY", raising=False)
+
+    status = c.prepare_state_sync()
+    try:
+        assert status["event_count"] == 1
+        assert not backup.exists()
+    finally:
+        c.state_db.close()
+        c.state_db = None

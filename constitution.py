@@ -334,6 +334,82 @@ def prepare_state_sync() -> dict:
     ``IMPORT_JSONL_ON_EMPTY=1``.
     """
     global state_db
+    should_rebuild = os.environ.get("REBUILD_ROCKS_FROM_JSONL") == "1"
+    if should_rebuild:
+        if state_db is not None:
+            raise RuntimeError(
+                "cannot rebuild RocksDB after the live state handle is open"
+            )
+        rocks_path = pathlib.Path(ROCKS_PATH)
+        backup_path = pathlib.Path(str(rocks_path) + ".pre-rebuild")
+        if not JSONL_PATH.is_file():
+            message = f"archival tape not found: {JSONL_PATH}"
+            STATE_STATUS.update(
+                ready=False, importing=False, error=message, event_count=0
+            )
+            raise RuntimeError(message)
+        if backup_path.exists():
+            message = f"rebuild backup already exists: {backup_path}"
+            STATE_STATUS.update(
+                ready=False, importing=False, error=message, event_count=0
+            )
+            raise RuntimeError(message)
+        if not rocks_path.exists():
+            message = f"Rocks projection does not exist: {rocks_path}"
+            STATE_STATUS.update(
+                ready=False, importing=False, error=message, event_count=0
+            )
+            raise RuntimeError(message)
+
+        probe = RocksDb.open(rocks_path)
+        try:
+            existing_count = ROOT.events.len(probe)
+        finally:
+            probe.close()
+        if existing_count == 0:
+            message = f"Rocks projection is empty; refusing rebuild: {rocks_path}"
+            STATE_STATUS.update(
+                ready=False, importing=False, error=message, event_count=0
+            )
+            raise RuntimeError(message)
+
+        rocks_path.rename(backup_path)
+        STATE_STATUS.update(
+            ready=False, importing=True, error=None, event_count=0
+        )
+        try:
+            import_jsonl_tape(JSONL_PATH, rocks_path)
+        except BaseException as exc:
+            try:
+                if rocks_path.exists():
+                    RocksDb.open(rocks_path).destroy()
+                if rocks_path.exists():
+                    raise RuntimeError(
+                        f"incomplete projection could not be removed: {rocks_path}"
+                    )
+                backup_path.rename(rocks_path)
+            except BaseException as rollback_exc:
+                message = (
+                    f"rebuild failed ({exc}); automatic rollback failed "
+                    f"({rollback_exc}); backup retained at {backup_path}"
+                )
+                STATE_STATUS.update(
+                    ready=False,
+                    importing=False,
+                    error=message,
+                    event_count=0,
+                )
+                raise RuntimeError(message) from rollback_exc
+            STATE_STATUS.update(
+                ready=False,
+                importing=False,
+                error=str(exc),
+                event_count=existing_count,
+            )
+            raise
+        finally:
+            STATE_STATUS["importing"] = False
+
     if state_db is not None:
         count = ROOT.events.len(state_db)
         STATE_STATUS.update(
