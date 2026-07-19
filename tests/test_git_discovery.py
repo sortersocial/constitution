@@ -434,7 +434,7 @@ def test_emission_distribution_sums_exactly_to_total(
     assert entry.discovery_snapshot_id == "ranked-snapshot"
 
 
-def test_single_contributor_ranking_is_total_and_uses_no_pairwise_votes(
+def test_single_commit_ranking_skips_pairwise(
     discovery_config, monkeypatch,
 ):
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
@@ -451,6 +451,65 @@ def test_single_contributor_ranking_is_total_and_uses_no_pairwise_votes(
     }], epoch=0))
     assert ranking == {"alice": c.Decimal("1")}
     assert used == []
+    assert info["ranking_event_id"]
+
+
+def test_same_contributor_multiple_commits_runs_pairwise(
+    discovery_config, monkeypatch,
+):
+    monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+    calls = {"n": 0}
+
+    async def models(n=3):
+        return ["m1", "m2", "m3"]
+
+    async def compare(model_id, side_a, side_b, **kwargs):
+        calls["n"] += 1
+        assert "commit_id" in side_a and "commit_id" in side_b
+        if kwargs.get("persist"):
+            attempt_id = c.attempt_id_for(kwargs["comparison_id"], model_id, 1)
+            await c.append_evidence(kwargs["epoch"], "llm.judgment", {
+                "judgment_id": c.judgment_id_for({
+                    "attempt_id": attempt_id,
+                    "comparison_id": kwargs["comparison_id"],
+                    "model_id": model_id,
+                    "winner": "A",
+                    "ratio": "2:1",
+                    "explanation": "ok",
+                }),
+                "attempt_id": attempt_id,
+                "comparison_id": kwargs["comparison_id"],
+                "model_id": model_id,
+                "winner": "A",
+                "ratio": "2:1",
+                "explanation": "ok",
+                "summary": "ok",
+            })
+        return {"winner": "A", "ratio": "2:1", "explanation": "ok"}
+
+    monkeypatch.setattr(c, "fetch_top_models", models)
+    monkeypatch.setattr(c, "llm_pairwise_compare", compare)
+    monkeypatch.setattr(c, "OPENROUTER_API_KEY", "test-key")
+    commits = [
+        {
+            "contributor": "alice",
+            "oid": "sha1:" + char * 40,
+            "message": f"msg-{char}",
+            "patch": f"patch-{char}",
+        }
+        for char in ("a", "b", "c")
+    ]
+    ranking, used, info = asyncio.run(c.rank_commits(commits, epoch=0))
+    assert set(ranking) == {"alice"}
+    assert ranking["alice"] > 0
+    assert used == ["m1", "m2", "m3"]
+    assert calls["n"] >= 3
+    completed = next(
+        e for e in c.store.read()
+        if isinstance(e, c.Evidence) and e.kind == "ranking.completed"
+    )
+    assert len(completed.payload["commit_ranking"]) == 3
+    assert "alice" in completed.payload["contributor_ranking"]
     assert info["ranking_event_id"]
 
 
@@ -479,16 +538,16 @@ def test_any_council_failure_aborts_ranking(discovery_config, monkeypatch):
         asyncio.run(c.rank_commits(commits, epoch=0))
 
 
-def test_contested_ranking_requires_openrouter_key(monkeypatch):
+def test_multi_commit_ranking_requires_openrouter_key(monkeypatch):
     monkeypatch.setattr(c, "OPENROUTER_API_KEY", "")
     commits = [
         {
-            "contributor": contributor,
+            "contributor": "alice",
             "oid": "sha1:" + char * 40,
-            "message": contributor,
+            "message": char,
             "patch": "patch",
         }
-        for contributor, char in [("alice", "a"), ("bob", "b")]
+        for char in ("a", "b")
     ]
     with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
         asyncio.run(c.rank_commits(commits))

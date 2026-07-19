@@ -507,7 +507,7 @@
 
         (bind or-state @(:state or-mock))
         (assert! (pos? (:model-requests or-state))    "OpenRouter /models was called")
-        (assert! (>= (:compare-requests or-state) 3) "at least 3 pairwise LLM calls (2 authors × 3 models)")
+        (assert! (>= (:compare-requests or-state) 3) "at least 3 pairwise LLM calls (2 commits × 3 models)")
 
         (bind ledger2 (get-json base-url "/api/ledger"))
         (assert! (>= (count ledger2) 3)
@@ -543,6 +543,8 @@
                  "epoch page links comparisons")
         (assert! (str/includes? epoch-html "/judgments/")
                  "epoch page links judgments")
+        (assert! (str/includes? epoch-html "commit ranking")
+                 "epoch page shows per-commit ranking")
         (bind commit-href
           (second (re-find #"/commits/(c_[a-f0-9]+)" epoch-html)))
         (assert! (some? commit-href) "found a commit id on epoch page")

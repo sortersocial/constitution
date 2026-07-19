@@ -503,20 +503,22 @@ def _epochs_in_ledger() -> list[int]:
 
 
 def build_pairwise_prompt(side_a: dict, side_b: dict) -> str:
-    return f"""You are ranking contributions to an open source project.
-Compare these two sides (each may be one or more commits). Decide which side contributed more.
+    return f"""You are ranking individual git commits to an open source project.
+Compare these two commits. Decide which commit contributed more.
 Return ONLY a JSON object: {{"winner": "A" or "B", "ratio": "N:M", "explanation": "..."}}
 
-Side A — commit messages:
+Side A — contributor: {side_a.get('contributor', '?')}
+Side A — commit message:
 {side_a['message']}
 
-Side A — unified diffs (full patches):
+Side A — unified diff (full patch):
 {side_a['diff']}
 
-Side B — commit messages:
+Side B — contributor: {side_b.get('contributor', '?')}
+Side B — commit message:
 {side_b['message']}
 
-Side B — unified diffs (full patches):
+Side B — unified diff (full patch):
 {side_b['diff']}"""
 
 
@@ -1518,14 +1520,26 @@ async def broadcast_js(js: str):
         await queue.put(js)
 
 
-def _author_side_for_llm(author: str, author_commits: dict) -> dict:
-    cs = author_commits[author]
+def _commit_side_for_llm(row: dict) -> dict:
+    oid = row["oid"]
+    short = oid.split(":", 1)[1][:8] if ":" in oid else oid[:8]
     return {
-        "message": "\n".join(f"[{c['sha']}] {c['message']}" for c in cs),
-        "diff": "\n\n".join(f"=== {c['sha']} ===\n{c['diff']}" for c in cs),
-        "commit_ids": [c["commit_id"] for c in cs],
-        "contributor": author,
+        "message": f"[{short}] {row['message']}",
+        "diff": row["patch"] or "",
+        "commit_id": commit_id_for_oid(oid),
+        "contributor": row["contributor"],
+        "oid": oid,
     }
+
+
+def _rollup_contributor_scores(
+    ordered: list[dict], commit_scores: list[Decimal]
+) -> dict[str, Decimal]:
+    totals: dict[str, Decimal] = {}
+    for row, score in zip(ordered, commit_scores):
+        contributor = row["contributor"]
+        totals[contributor] = totals.get(contributor, Decimal("0")) + score
+    return totals
 
 
 def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
@@ -1546,101 +1560,106 @@ def _find_ranking_models(ranking_run_id: str) -> list[str] | None:
 
 
 async def rank_commits(commits: list[dict], *, epoch: int = -1):
+    """Pairwise-rank every eligible commit; roll scores up to contributors."""
     if not commits:
         return {}, [], {"ranking_run_id": "", "ranking_event_id": ""}
 
-    commit_ids = sorted(commit_id_for_oid(row["oid"]) for row in commits)
+    ordered = sorted(commits, key=lambda r: r["oid"])
+    commit_ids = [commit_id_for_oid(row["oid"]) for row in ordered]
     ranking_run_id = _content_id("rank", {
         "epoch": epoch,
-        "commit_ids": commit_ids,
+        "commit_ids": sorted(commit_ids),
     })
-    contributors = sorted(set(c["contributor"] for c in commits))
+    contributors = sorted({c["contributor"] for c in ordered})
 
-    if len(contributors) == 1:
+    # Nothing to compare: a single commit (not a single contributor).
+    if len(ordered) == 1:
         await append_evidence(epoch, "ranking.started", {
             "ranking_run_id": ranking_run_id,
             "commit_ids": commit_ids,
             "contributors": contributors,
             "models": [],
-            "summary": f"ranking epoch {epoch}: single contributor",
+            "summary": f"ranking epoch {epoch}: single commit",
         })
-        ranking = {contributors[0]: Decimal("1")}
+        commit_ranking = {commit_ids[0]: "1"}
+        contributor_ranking = {ordered[0]["contributor"]: Decimal("1")}
         completed = await append_evidence(epoch, "ranking.completed", {
             "ranking_run_id": ranking_run_id,
             "models": [],
-            "ranking": {contributors[0]: "1"},
+            "commit_ranking": commit_ranking,
+            "contributor_ranking": {ordered[0]["contributor"]: "1"},
+            "ranking": {ordered[0]["contributor"]: "1"},
             "judgment_ids": [],
-            "summary": f"Only {contributors[0]} is eligible; rank is 1.0",
+            "summary": f"Only one eligible commit; {ordered[0]['contributor']} rank 1.0",
         })
         await broadcast_audit(
             "ranking",
-            f"Only {contributors[0]} is eligible; rank is 1.0",
+            f"Only one eligible commit; {ordered[0]['contributor']} rank 1.0",
             progress=90,
             phase="finalizing",
             evidence_event_id=completed.event_id,
             evidence_url=_evidence_url("event", completed.event_id),
             links={"epoch": _evidence_url("epoch", str(epoch))},
         )
-        return ranking, [], {
+        return contributor_ranking, [], {
             "ranking_run_id": ranking_run_id,
             "ranking_event_id": completed.event_id,
         }
 
     if not (OPENROUTER_API_KEY or "").strip():
         raise RuntimeError(
-            "OPENROUTER_API_KEY is required when multiple contributors need ranking"
+            "OPENROUTER_API_KEY is required when multiple commits need ranking"
         )
 
     models = _find_ranking_models(ranking_run_id)
     if models is None:
         models = await fetch_top_models(n=3)
     if not models:
-        raise RuntimeError("no council models available for contributor ranking")
+        raise RuntimeError("no council models available for commit ranking")
     await append_evidence(epoch, "ranking.started", {
         "ranking_run_id": ranking_run_id,
         "commit_ids": commit_ids,
         "contributors": contributors,
         "models": models,
-        "summary": f"Council selected: {', '.join(models)}",
+        "summary": (
+            f"Council selected: {', '.join(models)} — "
+            f"{len(ordered)} commits"
+        ),
     })
     await broadcast_audit(
         "council",
-        f"Council selected: {', '.join(models)}",
+        f"Council selected: {', '.join(models)} — ranking {len(ordered)} commits",
         progress=35,
         phase="ranking",
     )
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
-        ["div.log-council", f"Council: {', '.join(models)} — {len(commits)} commits"]
+        ["div.log-council",
+            f"Council: {', '.join(models)} — {len(ordered)} commits"]
     ]))
 
-    authors = contributors
-    author_commits = {a: [] for a in authors}
-    for row in sorted(commits, key=lambda r: r["oid"]):
-        author_commits[row["contributor"]].append({
-            "message": row["message"],
-            "sha": row["oid"].split(":", 1)[1][:8],
-            "diff": row["patch"],
-            "commit_id": commit_id_for_oid(row["oid"]),
-        })
-
+    sides = [_commit_side_for_llm(row) for row in ordered]
     judgment_ids: list[str] = []
 
     async def compare_fn(i, j):
-        a1, a2 = authors[i], authors[j]
-        side_a = _author_side_for_llm(a1, author_commits)
-        side_b = _author_side_for_llm(a2, author_commits)
+        side_a, side_b = sides[i], sides[j]
+        label_a = f"{side_a['commit_id'][:16]} ({side_a['contributor']})"
+        label_b = f"{side_b['commit_id'][:16]} ({side_b['contributor']})"
         prompt = build_pairwise_prompt(side_a, side_b)
         comparison_material = {
             "ranking_run_id": ranking_run_id,
             "side_a": {
-                "contributor": a1,
-                "commit_ids": side_a["commit_ids"],
+                "contributor": side_a["contributor"],
+                "commit_id": side_a["commit_id"],
+                "commit_ids": [side_a["commit_id"]],
+                "oid": side_a["oid"],
                 "message": _bytes_blob(side_a["message"]),
                 "diff": _bytes_blob(side_a["diff"]),
             },
             "side_b": {
-                "contributor": a2,
-                "commit_ids": side_b["commit_ids"],
+                "contributor": side_b["contributor"],
+                "commit_id": side_b["commit_id"],
+                "commit_ids": [side_b["commit_id"]],
+                "oid": side_b["oid"],
                 "message": _bytes_blob(side_b["message"]),
                 "diff": _bytes_blob(side_b["diff"]),
             },
@@ -1650,22 +1669,24 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         comparison_material = {
             **comparison_material,
             "comparison_id": comparison_id,
-            "summary": f"Comparing {a1} with {a2}",
+            "summary": f"Comparing {label_a} with {label_b}",
         }
         cmp_ev = await append_evidence(epoch, "comparison.input", comparison_material)
         await broadcast_audit(
             "comparison",
-            f"Comparing {a1} with {a2}",
+            f"Comparing commits {label_a} vs {label_b}",
             phase="ranking",
             evidence_event_id=cmp_ev.event_id,
             evidence_url=_evidence_url("comparison", comparison_id),
             links={
                 "comparison": _evidence_url("comparison", comparison_id),
+                "commit_a": _evidence_url("commit", side_a["commit_id"]),
+                "commit_b": _evidence_url("commit", side_b["commit_id"]),
                 "epoch": _evidence_url("epoch", str(epoch)),
             },
         )
         await broadcast_js(exec_event(Three[Selector("#emission-status")][MORPH][
-            ["div#emission-status", f"Comparing {a1} vs {a2}…"]
+            ["div#emission-status", f"Comparing {label_a} vs {label_b}…"]
         ]))
         results = []
         for model in models:
@@ -1697,9 +1718,15 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                 jud_id = (existing or _find_judgment(comparison_id, model) or {}).get(
                     "judgment_id"
                 )
+                win_label = (
+                    f"{sides[w]['commit_id'][:16]} ({sides[w]['contributor']})"
+                )
+                lose_label = (
+                    f"{sides[l]['commit_id'][:16]} ({sides[l]['contributor']})"
+                )
                 await broadcast_audit(
                     "vote",
-                    f"{model}: {authors[w]} over {authors[l]} ({result['ratio']})",
+                    f"{model}: {win_label} over {lose_label} ({result['ratio']})",
                     phase="ranking",
                     evidence_url=(
                         _evidence_url("judgment", jud_id) if jud_id else None
@@ -1714,8 +1741,8 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                 await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
                     ["div.log-vote",
                         ["span.model", model], " — ",
-                        ["span.winner", authors[w]], f" beat ",
-                        ["span.loser", authors[l]], f" ({result['ratio']}) ",
+                        ["span.winner", win_label], f" beat ",
+                        ["span.loser", lose_label], f" ({result['ratio']}) ",
                         ["span.explanation", result["explanation"]],
                     ]
                 ]))
@@ -1745,24 +1772,46 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             ["div#emission-status", label]
         ]))
 
-    pairs = await pairwise_rank(len(authors), compare_fn, progress_fn)
+    pairs = await pairwise_rank(len(ordered), compare_fn, progress_fn)
 
     if not pairs:
-        ranking = {authors[0]: Decimal("1")} if authors else {}
+        commit_score_list = [Decimal("1")]
     else:
         scores = rank_centrality(pairs)
-        ranking = {authors[i]: Decimal(str(scores[i])) for i in range(len(authors))}
-    ranking_rows = sorted(ranking.items(), key=lambda x: x[1], reverse=True)
+        commit_score_list = [Decimal(str(scores[i])) for i in range(len(ordered))]
+
+    commit_ranking = {
+        commit_ids[i]: str(commit_score_list[i]) for i in range(len(ordered))
+    }
+    contributor_totals = _rollup_contributor_scores(ordered, commit_score_list)
+    contrib_rows = sorted(
+        contributor_totals.items(), key=lambda x: x[1], reverse=True
+    )
+    commit_rows = sorted(
+        ((commit_ids[i], commit_score_list[i], ordered[i]["contributor"])
+         for i in range(len(ordered))),
+        key=lambda x: x[1],
+        reverse=True,
+    )
     completed = await append_evidence(epoch, "ranking.completed", {
         "ranking_run_id": ranking_run_id,
         "models": models,
-        "ranking": {a: str(s) for a, s in ranking_rows},
+        "commit_ranking": commit_ranking,
+        "contributor_ranking": {a: str(s) for a, s in contrib_rows},
+        "ranking": {a: str(s) for a, s in contrib_rows},
         "judgment_ids": judgment_ids,
-        "summary": "Ranking: " + ", ".join(f"{a} {s:.4f}" for a, s in ranking_rows),
+        "summary": (
+            "Commit ranking: "
+            + ", ".join(
+                f"{cid[:16]}={float(s):.4f}" for cid, s, _ in commit_rows[:12]
+            )
+            + ("…" if len(commit_rows) > 12 else "")
+        ),
     })
     await broadcast_audit(
         "ranking",
-        "Ranking: " + ", ".join(f"{a} {s:.4f}" for a, s in ranking_rows),
+        "Contributor rollup: "
+        + ", ".join(f"{a} {s:.4f}" for a, s in contrib_rows),
         progress=90,
         phase="finalizing",
         evidence_event_id=completed.event_id,
@@ -1772,10 +1821,10 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
     await broadcast_js(exec_event(Three[Selector("#emission-log")][PREPEND][
         ["div.log-ranking",
             ["b", "Ranking: "],
-            *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in ranking_rows],
+            *[["span.rank-entry", f"{a} {float(s):.3f}  "] for a, s in contrib_rows],
         ]
     ]))
-    return ranking, models, {
+    return contributor_totals, models, {
         "ranking_run_id": ranking_run_id,
         "ranking_event_id": completed.event_id,
     }
@@ -2352,6 +2401,23 @@ async def epoch_detail(epoch: int):
 
     ranking_nodes: list = []
     if ranking_completed:
+        commit_ranking = ranking_completed.payload.get("commit_ranking") or {}
+        contrib_ranking = (
+            ranking_completed.payload.get("contributor_ranking")
+            or ranking_completed.payload.get("ranking")
+            or {}
+        )
+        commit_rank_links = [
+            (
+                f"{cid[:20]} = {score}",
+                _evidence_path("commit", cid),
+            )
+            for cid, score in sorted(
+                commit_ranking.items(),
+                key=lambda kv: Decimal(str(kv[1])),
+                reverse=True,
+            )
+        ]
         ranking_nodes = [
             ["p", ranking_completed.payload.get("summary") or "ranking completed"],
             _dl_rows([
@@ -2362,10 +2428,10 @@ async def epoch_detail(epoch: int):
                     ranking_completed.event_id,
                 )),
             ]),
-            ["pre.blob", json.dumps(
-                ranking_completed.payload.get("ranking") or {},
-                indent=2, sort_keys=True,
-            )],
+            ["h3", "commit ranking"],
+            _link_list(commit_rank_links) if commit_rank_links else ["p.note", "(none)"],
+            ["h3", "contributor rollup"],
+            ["pre.blob", json.dumps(contrib_ranking, indent=2, sort_keys=True)],
         ]
     elif ranking_started:
         ranking_nodes = [["p.note", f"Ranking started: {ranking_started.event_id}"]]
@@ -2386,14 +2452,9 @@ async def epoch_detail(epoch: int):
     else:
         emission_node = ["p.note", "No emission for this epoch."]
 
-    contributors = {
-        e.payload.get("contributor")
-        for e in commit_evs
-        if e.payload.get("contributor")
-    }
     no_comparisons_note = "No comparisons."
-    if len(contributors) <= 1:
-        no_comparisons_note += " Single-contributor — no LLM judgments."
+    if len(commit_evs) <= 1:
+        no_comparisons_note += " Fewer than two eligible commits — nothing to pairwise-rank."
 
     body = [
         _evidence_nav(),
@@ -2511,9 +2572,14 @@ async def comparison_detail(comparison_id: str):
                     j.payload.get("summary") or jid,
                     _evidence_path("judgment", jid),
                 ))
-    commit_links = []
-    for cid in (side_a.get("commit_ids") or []) + (side_b.get("commit_ids") or []):
-        commit_links.append((cid, _evidence_path("commit", cid)))
+    commit_ids = []
+    for side in (side_a, side_b):
+        cid = side.get("commit_id")
+        if cid:
+            commit_ids.append(cid)
+        else:
+            commit_ids.extend(side.get("commit_ids") or [])
+    commit_links = [(cid, _evidence_path("commit", cid)) for cid in commit_ids]
     return _evidence_page(f"comparison {comparison_id[:24]}", [
         _evidence_nav(_a(_evidence_path("epoch", str(ev.epoch)), f"epoch {ev.epoch}")),
         ["div.eyebrow", "comparison"],
@@ -2522,8 +2588,8 @@ async def comparison_detail(comparison_id: str):
             ("summary", p.get("summary")),
             ("ranking_run_id", p.get("ranking_run_id")),
             ("evidence_event", _a(_evidence_path("event", ev.event_id), ev.event_id)),
-            ("side_a", side_a.get("contributor")),
-            ("side_b", side_b.get("contributor")),
+            ("side_a", f"{side_a.get('commit_id', '?')} ({side_a.get('contributor', '?')})"),
+            ("side_b", f"{side_b.get('commit_id', '?')} ({side_b.get('contributor', '?')})"),
         ]),
         ["p", _a(f"/comparisons/{comparison_id}/prompt", "download prompt")],
         ["h2", "commits"],
@@ -2534,12 +2600,12 @@ async def comparison_detail(comparison_id: str):
         _link_list(judgment_links),
         ["h2", "prompt"],
         _pre_blob(_blob_text(p.get("prompt"))),
-        ["h2", f"side A — {side_a.get('contributor', '?')}"],
+        ["h2", f"side A — {side_a.get('commit_id', side_a.get('contributor', '?'))}"],
         ["h3", "message"],
         _pre_blob(_blob_text(side_a.get("message"))),
         ["h3", "diff"],
         _pre_blob(_blob_text(side_a.get("diff"))),
-        ["h2", f"side B — {side_b.get('contributor', '?')}"],
+        ["h2", f"side B — {side_b.get('commit_id', side_b.get('contributor', '?'))}"],
         ["h3", "message"],
         _pre_blob(_blob_text(side_b.get("message"))),
         ["h3", "diff"],
@@ -3156,9 +3222,9 @@ async def watch():
                 ],
                 ["p.note",
                     (
-                        "Pairwise council voting is ready."
+                        "Pairwise council ranks every eligible commit."
                         if key_ok else
-                        "Single-contributor epochs can finalize, but contested rankings require OPENROUTER_API_KEY."
+                        "Epochs with two or more eligible commits require OPENROUTER_API_KEY."
                     )
                 ],
             ],
