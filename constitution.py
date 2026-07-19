@@ -27,8 +27,9 @@ Run: uv run constitution.py
 from decimal import Decimal, getcontext, DefaultContext
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import Request
 import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl, base64
 import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
@@ -269,7 +270,42 @@ class Evidence:
     payload: dict
 
 
-store = JsonlStore(JSONL_PATH)
+class DeferredJsonlStore:
+    """
+    Delay ledger replay until after the HTTP server binds.
+
+    A 450MB+ evidence ledger can take minutes to parse; doing that at import
+    time makes Fly health checks and the public site time out on every boot.
+    """
+
+    def __init__(self, path: pathlib.Path | str):
+        self.path = pathlib.Path(path)
+        self._inner: JsonlStore | None = None
+        self.ready = False
+
+    def load_sync(self) -> None:
+        self._inner = JsonlStore(self.path)
+        self.ready = True
+
+    def _require(self) -> JsonlStore:
+        if self._inner is None:
+            self.load_sync()
+        assert self._inner is not None
+        return self._inner
+
+    def read(self) -> list:
+        if self._inner is None:
+            return []
+        return self._inner.read()
+
+    async def append(self, e) -> None:
+        await self._require().append(e)
+
+    async def atomic(self, fn):
+        return await self._require().atomic(fn)
+
+
+store = DeferredJsonlStore(JSONL_PATH)
 _LEDGER_LOCK = asyncio.Lock()
 
 
@@ -2211,10 +2247,29 @@ async def get_ledger(offset: int = 0, limit: int = 100, full: int = 0):
     return rows
 
 
+@app.middleware("http")
+async def ledger_ready_gate(request: Request, call_next):
+    if request.url.path == "/api/health":
+        return await call_next(request)
+    if isinstance(store, DeferredJsonlStore) and not store.ready:
+        return JSONResponse(
+            {
+                "ok": False,
+                "loading": True,
+                "message": "replaying ledger into memory",
+            },
+            status_code=503,
+        )
+    return await call_next(request)
+
+
 @app.get("/api/health")
 async def get_health():
-    """Liveness only — must not touch the ledger (health checks during ranking)."""
-    return {"ok": True}
+    """Liveness only — must not touch the ledger (boot + ranking)."""
+    return {
+        "ok": True,
+        "ledger_ready": bool(getattr(store, "ready", True)),
+    }
 
 
 @app.get("/api/epoch")
@@ -3703,8 +3758,17 @@ async def callback(request: Request, code: str):
 
 @app.on_event("startup")
 async def startup():
-    if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
-        asyncio.create_task(epoch_loop())
+    async def boot():
+        if isinstance(store, DeferredJsonlStore) and not store.ready:
+            print("replaying ledger…", flush=True)
+            await asyncio.to_thread(store.load_sync)
+            n = len(store.read())
+            print(f"ledger ready: {n} events", flush=True)
+        if os.environ.get("DISABLE_EPOCH_LOOP") != "1":
+            asyncio.create_task(epoch_loop())
+
+    # Do not block bind/health on ledger replay.
+    asyncio.create_task(boot())
 
 
 if __name__ == "__main__":
