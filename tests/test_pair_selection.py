@@ -297,6 +297,8 @@ def test_progress_reports_zip_phase():
         assert "total" in e
         assert e["pass"] == 1          # exactly one logical pass
         assert e["step"] >= 1
+        assert sorted(e["ranking"]) == [0, 1, 2]
+        assert 1 <= e["voted_count"] <= 3
         assert e["total"] == 2         # n-1 = 2
 
 

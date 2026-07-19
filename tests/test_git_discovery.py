@@ -601,6 +601,20 @@ def test_watch_page_has_live_controls_progress_and_key_warning(
 ):
     monkeypatch.setattr(c, "OPENROUTER_API_KEY", "")
     monkeypatch.setattr(c, "current_epoch", lambda: (3, 0, 1))
+    monkeypatch.setattr(c, "RANKING_VIEW_STATE", {
+        "epoch": 3,
+        "phase": "zip",
+        "models": ["anthropic/claude-sonnet-4.5", "x-ai/grok-4.5"],
+        "voted_count": 1,
+        "rows": [{
+            "position": 1,
+            "commit_id": "c_watch",
+            "contributor": "alice",
+            "message": "watch this commit",
+            "voted": True,
+            "comparison_ids": ["cmp_watch"],
+        }],
+    })
     response = asyncio.run(c.watch())
     html = response.body.decode()
     assert 'role="progressbar"' in html
@@ -608,6 +622,14 @@ def test_watch_page_has_live_controls_progress_and_key_warning(
     assert 'id="pause"' in html
     assert "new EventSource('/sse')" in html
     assert "OpenRouter key missing" in html
+    assert 'id="council-models"' in html
+    assert 'id="commit-set"' in html
+    assert "anthropic/claude-sonnet-4.5" in html
+    assert "x-ai/grok-4.5" in html
+    assert "c_watch" in html
+    assert "cmp_watch" in html
+    assert "voted set" in html
+    assert "unvoted set" in html
 
 
 def test_audit_events_are_json_sse_and_update_process_state(monkeypatch):

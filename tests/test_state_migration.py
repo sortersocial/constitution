@@ -259,14 +259,19 @@ def test_large_imported_patch_is_not_decoded_by_epoch_or_detail_cards(
         assert len(epoch_response.body) < 1_000_000
         assert len(commit_response.body) < 1_000_000
         assert len(comparison_response.body) < 1_000_000
-        assert decoded_refs == []
+        patch_sha = c._sha256_hex(patch)
+        assert decoded_refs == [patch_sha, patch_sha]
+        comparison_html = comparison_response.body.decode()
+        assert "diff preview" in comparison_html
+        assert "preview truncated" in comparison_html
 
         assert asyncio.run(c.commit_patch_download("c_imported")).body == patch
-        assert decoded_refs == [c._sha256_hex(patch)]
+        assert decoded_refs == [patch_sha, patch_sha, patch_sha]
         assert (
             asyncio.run(c.comparison_diff_download("cmp_imported", "a")).body
             == patch
         )
+        assert decoded_refs == [patch_sha, patch_sha, patch_sha, patch_sha]
     finally:
         db.close()
 

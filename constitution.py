@@ -1040,6 +1040,13 @@ def _blob_text(blob) -> str:
     return str(blob)
 
 
+def _blob_preview(blob, limit: int = 12_000) -> str:
+    text = _blob_text(blob)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n… preview truncated; {len(text) - limit:,} characters omitted"
+
+
 def _discovery_for_epoch(epoch: int) -> GitDiscovery | None:
     stored = ROOT.discoveries_by_epoch.key(epoch).get(_db())
     row = _typed(_hydrate_heavy_fields(stored) if stored else None)
@@ -1250,7 +1257,13 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
             await compare(i, i + 1)
             uf.union(i, i + 1)
         if progress_fn:
-            await progress_fn({"phase": "spanning_tree", "step": i + 1, "total": n - 1})
+            await progress_fn({
+                "phase": "spanning_tree",
+                "step": i + 1,
+                "total": n - 1,
+                "ranking": list(range(n)),
+                "voted_count": i + 2,
+            })
 
     # --- Phase 2: zip sort ---
     # Re-derive the ranking from scratch before every step.  A comparison at
@@ -1275,6 +1288,16 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
                 break
 
         if target is None:
+            if progress_fn:
+                await progress_fn({
+                    "phase": "zip",
+                    "pass": 1,
+                    "step": n - 1,
+                    "total": n - 1,
+                    "ranking": ranking,
+                    "voted_count": n,
+                    "complete": True,
+                })
             break  # every adjacent edge has at least one LLM-reasoned result
 
         pos, a, b = target
@@ -1286,6 +1309,8 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
                 "pass": 1,
                 "step": pos + 1,
                 "total": n - 1,
+                "ranking": ranking,
+                "voted_count": pos + 2,
             })
 
     return pairs
@@ -2123,6 +2148,14 @@ PROCESS_STATE = {
     "progress": 100,
     "message": "Waiting for the next epoch",
 }
+RANKING_VIEW_STATE = {
+    "epoch": None,
+    "phase": "idle",
+    "models": [],
+    "voted_count": 0,
+    "rows": [],
+}
+RANKING_COMPARISONS: dict[str, list[str]] = {}
 
 
 def _sse_event(event_name: str, payload: dict) -> str:
@@ -2176,6 +2209,48 @@ async def broadcast_js(js: str):
         await queue.put(js)
 
 
+async def broadcast_ranking_state():
+    wire = _sse_event("ranking_state", RANKING_VIEW_STATE)
+    for queue in list(SSE_CLIENTS):
+        await queue.put(wire)
+
+
+def _comparison_ids_for_commit_id(commit_id: str) -> list[str]:
+    path = ROOT.comparison_ids_by_commit.key(commit_id)
+    return path.iter(_db()) if path.len(_db()) else []
+
+
+def _set_ranking_view(
+    ordered: list[dict],
+    *,
+    epoch: int,
+    models: list[str],
+    phase: str,
+    ranking: list[int] | None = None,
+    voted_count: int = 0,
+) -> None:
+    order = ranking if ranking is not None else list(range(len(ordered)))
+    rows = []
+    for position, index in enumerate(order):
+        row = ordered[index]
+        commit_id = commit_id_for_oid(row["oid"])
+        rows.append({
+            "position": position + 1,
+            "commit_id": commit_id,
+            "contributor": row.get("contributor") or "?",
+            "message": row.get("message") or "",
+            "voted": position < voted_count,
+            "comparison_ids": list(RANKING_COMPARISONS.get(commit_id, ())),
+        })
+    RANKING_VIEW_STATE.update({
+        "epoch": epoch,
+        "phase": phase,
+        "models": list(models),
+        "voted_count": min(voted_count, len(rows)),
+        "rows": rows,
+    })
+
+
 def _commit_side_for_llm(row: dict) -> dict:
     oid = row["oid"]
     short = oid.split(":", 1)[1][:8] if ":" in oid else oid[:8]
@@ -2222,10 +2297,27 @@ def _find_ranking_models(ranking_run_id: str) -> list[str] | None:
 async def rank_commits(commits: list[dict], *, epoch: int = -1):
     """Pairwise-rank every eligible commit; roll scores up to contributors."""
     if not commits:
+        RANKING_COMPARISONS.clear()
+        RANKING_VIEW_STATE.update({
+            "epoch": epoch,
+            "phase": "complete",
+            "models": [],
+            "voted_count": 0,
+            "rows": [],
+        })
+        await broadcast_ranking_state()
         return {}, [], {"ranking_run_id": "", "ranking_event_id": ""}
 
     ordered = sorted(commits, key=lambda r: r["oid"])
     commit_ids = [commit_id_for_oid(row["oid"]) for row in ordered]
+    RANKING_COMPARISONS.clear()
+    _set_ranking_view(
+        ordered,
+        epoch=epoch,
+        models=[],
+        phase="spanning_tree",
+    )
+    await broadcast_ranking_state()
     ranking_run_id = _content_id("rank", {
         "epoch": epoch,
         "commit_ids": sorted(commit_ids),
@@ -2234,6 +2326,14 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
 
     # Nothing to compare: a single commit (not a single contributor).
     if len(ordered) == 1:
+        _set_ranking_view(
+            ordered,
+            epoch=epoch,
+            models=[],
+            phase="complete",
+            voted_count=1,
+        )
+        await broadcast_ranking_state()
         await append_evidence(epoch, "ranking.started", {
             "ranking_run_id": ranking_run_id,
             "commit_ids": commit_ids,
@@ -2271,6 +2371,13 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             "OPENROUTER_API_KEY is required when multiple commits need ranking"
         )
 
+    existing_comparisons = await asyncio.to_thread(
+        lambda: {
+            commit_id: _comparison_ids_for_commit_id(commit_id)
+            for commit_id in commit_ids
+        }
+    )
+    RANKING_COMPARISONS.update(existing_comparisons)
     models = _find_ranking_models(ranking_run_id)
     if models is None:
         models = await fetch_top_models(n=3)
@@ -2278,6 +2385,13 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
     models = _with_preferred_council(models)
     if not models:
         raise RuntimeError("no council models available for commit ranking")
+    _set_ranking_view(
+        ordered,
+        epoch=epoch,
+        models=models,
+        phase="spanning_tree",
+    )
+    await broadcast_ranking_state()
     await append_evidence(epoch, "ranking.started", {
         "ranking_run_id": ranking_run_id,
         "commit_ids": commit_ids,
@@ -2338,6 +2452,10 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             "summary": f"Comparing {label_a} with {label_b}",
         }
         cmp_ev = await append_evidence(epoch, "comparison.input", comparison_material)
+        for commit_id in (side_a["commit_id"], side_b["commit_id"]):
+            comparison_ids = RANKING_COMPARISONS.setdefault(commit_id, [])
+            if comparison_id not in comparison_ids:
+                comparison_ids.append(comparison_id)
         await broadcast_audit(
             "comparison",
             f"Comparing commits {label_a} vs {label_b}",
@@ -2450,6 +2568,15 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         else:
             label = f"Zip pass {ev['pass']}: {ev['step']}/{ev['total']}"
             percent = 70 + round(20 * ev["step"] / max(ev["total"], 1))
+        _set_ranking_view(
+            ordered,
+            epoch=epoch,
+            models=models,
+            phase=ev["phase"],
+            ranking=ev.get("ranking"),
+            voted_count=ev.get("voted_count", 0),
+        )
+        await broadcast_ranking_state()
         await broadcast_audit(
             "progress", label, progress=percent, phase="ranking"
         )
@@ -2465,6 +2592,20 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         scores = await asyncio.to_thread(rank_centrality, pairs)
         commit_score_list = [Decimal(str(scores[i])) for i in range(len(ordered))]
 
+    final_order = sorted(
+        range(len(ordered)),
+        key=lambda index: commit_score_list[index],
+        reverse=True,
+    )
+    _set_ranking_view(
+        ordered,
+        epoch=epoch,
+        models=models,
+        phase="complete",
+        ranking=final_order,
+        voted_count=len(ordered),
+    )
+    await broadcast_ranking_state()
     commit_ranking = {
         commit_ids[i]: str(commit_score_list[i]) for i in range(len(ordered))
     }
@@ -3477,6 +3618,8 @@ async def comparison_detail(comparison_id: str):
                      if cid_a else _side_label(side_a))],
                 ["h4", "message"],
                 _pre_blob(_blob_text(side_a.get("message")), cls="blob compact"),
+                ["h4", "diff preview"],
+                ["pre.blob.diff-preview", _blob_preview(side_a.get("diff"))],
                 ["p", _a(
                     f"/comparisons/{comparison_id}/diff/a",
                     "download full diff A",
@@ -3488,6 +3631,8 @@ async def comparison_detail(comparison_id: str):
                      if cid_b else _side_label(side_b))],
                 ["h4", "message"],
                 _pre_blob(_blob_text(side_b.get("message")), cls="blob compact"),
+                ["h4", "diff preview"],
+                ["pre.blob.diff-preview", _blob_preview(side_b.get("diff"))],
                 ["p", _a(
                     f"/comparisons/{comparison_id}/diff/b",
                     "download full diff B",
@@ -3933,6 +4078,62 @@ code {
 }
 
 body.evidence-doc { max-width: 960px; }
+body.watch-doc { max-width: 1180px; }
+.watch-grid {
+  align-items: start;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, .8fr);
+}
+.watch-main, .ranking-column { min-width: 0; }
+.model-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+.model-list code { color: var(--link); }
+.commit-set {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+}
+.commit-row {
+  background: var(--g1);
+  border: var(--bv) solid;
+  border-color: var(--lo) var(--hi) var(--hi) var(--lo);
+  display: grid;
+  gap: 3px 8px;
+  grid-template-columns: 32px minmax(0, 1fr);
+  padding: 6px 8px;
+}
+.commit-row .rank {
+  color: var(--meta);
+  font-family: var(--font-code);
+  grid-row: 1 / span 3;
+}
+.commit-row .commit-main { min-width: 0; }
+.commit-row .commit-message {
+  color: var(--prose);
+  font-family: var(--font-prose);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.commit-row .comparison-links {
+  font-family: var(--font-code);
+  font-size: 10px;
+}
+.commit-row .comparison-links a { margin-right: 8px; }
+.set-label {
+  color: var(--ui);
+  font-family: var(--font-code);
+  font-size: 11px;
+  margin: 12px 0 4px;
+  text-transform: uppercase;
+}
+.set-label.unvoted { color: var(--meta); }
 .kv-list { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
 .kv { display: grid; gap: 8px; grid-template-columns: 140px 1fr; }
 .kv .k { color: var(--meta); font-family: var(--font-code); font-size: 11px; }
@@ -3953,6 +4154,11 @@ pre.blob {
   word-break: break-word;
 }
 pre.blob.compact { max-height: 12em; margin-bottom: 8px; }
+pre.blob.diff-preview {
+  box-shadow: inset 1px 1px 6px #000;
+  max-height: 22em;
+  min-height: 8em;
+}
 ul { padding-left: 1.2em; }
 li { margin: 4px 0; }
 p.lede { color: var(--ui); margin: 0 0 1em; }
@@ -4028,6 +4234,7 @@ table.dense td.msg { color: var(--prose); font-family: var(--font-prose); }
 
 @media (max-width: 720px) {
   .sides { grid-template-columns: 1fr; }
+  .watch-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 520px) {
   .event { grid-template-columns: 72px 1fr; }
@@ -4080,11 +4287,24 @@ def _watch_initial_state() -> dict:
                 "links": {"epoch": _evidence_path("epoch", str(event_.epoch))},
             })
     feed.extend(AUDIT_HISTORY)
+    ranking = {
+        **RANKING_VIEW_STATE,
+        "models": list(RANKING_VIEW_STATE["models"]),
+        "rows": [
+            {**row, "comparison_ids": list(row["comparison_ids"])}
+            for row in RANKING_VIEW_STATE["rows"]
+        ],
+    }
+    if not ranking["models"]:
+        latest = _typed(ROOT.latest_emission.get(db))
+        if isinstance(latest, Emission):
+            ranking["models"] = list(latest.models_used or [])
     return {
         "process": dict(PROCESS_STATE),
         "openrouter_configured": bool((OPENROUTER_API_KEY or "").strip()),
         "epoch": current_epoch()[0],
         "feed": feed[-200:],
+        "ranking": ranking,
     }
 
 
@@ -4097,6 +4317,8 @@ const fill = document.querySelector('#progress-fill');
 const progressLabel = document.querySelector('#progress-label');
 const play = document.querySelector('#play');
 const pause = document.querySelector('#pause');
+const councilModels = document.querySelector('#council-models');
+const commitSet = document.querySelector('#commit-set');
 const seen = new Set();
 let source = null;
 
@@ -4147,6 +4369,63 @@ function addEvent(event) {
   while (feed.children.length > 200) feed.lastElementChild.remove();
 }
 
+function renderRanking(state) {
+  councilModels.replaceChildren();
+  for (const model of state.models || []) {
+    const code = document.createElement('code');
+    code.textContent = model;
+    councilModels.appendChild(code);
+  }
+  if (!(state.models || []).length) {
+    const empty = document.createElement('span');
+    empty.className = 'note';
+    empty.textContent = 'Council not selected yet.';
+    councilModels.appendChild(empty);
+  }
+
+  commitSet.replaceChildren();
+  const rows = state.rows || [];
+  const groups = [
+    ['voted set', rows.filter(row => row.voted), 'voted'],
+    ['unvoted set', rows.filter(row => !row.voted), 'unvoted'],
+  ];
+  for (const [label, group, className] of groups) {
+    const heading = document.createElement('div');
+    heading.className = `set-label ${className}`;
+    heading.textContent = `${label} · ${group.length}`;
+    commitSet.appendChild(heading);
+    for (const item of group) {
+      const row = document.createElement('div');
+      row.className = 'commit-row';
+      const rank = document.createElement('span');
+      rank.className = 'rank';
+      rank.textContent = `#${item.position}`;
+      const main = document.createElement('div');
+      main.className = 'commit-main';
+      const commit = document.createElement('a');
+      commit.href = `/commits/${item.commit_id}`;
+      commit.textContent = item.commit_id.slice(0, 16);
+      main.append(commit, document.createTextNode(` · ${item.contributor}`));
+      const message = document.createElement('div');
+      message.className = 'commit-message';
+      message.textContent = item.message || '(no message)';
+      const comparisons = document.createElement('div');
+      comparisons.className = 'comparison-links';
+      for (const [index, comparisonId] of (item.comparison_ids || []).entries()) {
+        const link = document.createElement('a');
+        link.href = `/comparisons/${comparisonId}`;
+        link.textContent = `comparison ${index + 1}`;
+        comparisons.appendChild(link);
+      }
+      if (!(item.comparison_ids || []).length) {
+        comparisons.textContent = 'no comparisons yet';
+      }
+      row.append(rank, main, message, comparisons);
+      commitSet.appendChild(row);
+    }
+  }
+}
+
 function applyState(event) {
   processStatus.textContent = event.message || 'Waiting for the next epoch';
   setProgress(event.progress);
@@ -4165,6 +4444,7 @@ function connect() {
     connection.querySelector('span:last-child').textContent = 'live';
   };
   source.addEventListener('audit', event => applyState(JSON.parse(event.data)));
+  source.addEventListener('ranking_state', event => renderRanking(JSON.parse(event.data)));
   source.onerror = () => {
     connection.classList.remove('live');
     connection.classList.add('warn');
@@ -4185,6 +4465,7 @@ function disconnect() {
 play.addEventListener('click', connect);
 pause.addEventListener('click', disconnect);
 initial.feed.forEach(addEvent);
+renderRanking(initial.ranking || {models: [], rows: []});
 processStatus.textContent = initial.process.message;
 setProgress(initial.process.progress);
 connect();
@@ -4205,49 +4486,66 @@ async def watch():
             ["title", "slug — live constitution"],
             ["style", RawContent(_WATCH_CSS)],
         ],
-        ["body", ["main",
+        ["body.watch-doc", ["main",
             ["div.eyebrow", f"epoch {current_epoch()[0]} · constitutional audit"],
             ["h1", "watch the process"],
-            ["section.panel",
-                ["div.status-row",
-                    ["div#process-status", PROCESS_STATE["message"]],
-                    ["div#connection-status.badge", ["span.dot"], ["span", "connecting"]],
-                ],
-                ["div.progress-shell", {
-                    "role": "progressbar", "aria-label": "Emission progress",
-                    "aria-valuemin": "0", "aria-valuemax": "100",
-                    "aria-valuenow": str(PROCESS_STATE["progress"]),
-                },
-                    ["div#progress-fill"],
-                    ["div#progress-label", f"{PROCESS_STATE['progress']}%"],
-                ],
-                ["div.controls",
-                    ["button#play", {"type": "button", "disabled": "true"}, "▶ Play live feed"],
-                    ["button#pause", {"type": "button"}, "Ⅱ Pause feed"],
-                    ["span.note",
-                     "Play/pause only affect this browser feed — they do not run or stop emission. "
-                     "The server emits at each epoch boundary; status above is that process."],
-                ],
-            ],
-            ["section.panel",
-                ["div.status-row",
-                    ["strong", "Council readiness"],
-                    ["div.badge" + (".live" if key_ok else ".warn"),
-                        ["span.dot"],
-                        ["span", "OpenRouter configured" if key_ok else "OpenRouter key missing"],
+            ["div.watch-grid",
+                ["div.watch-main",
+                    ["section.panel",
+                        ["div.status-row",
+                            ["div#process-status", PROCESS_STATE["message"]],
+                            ["div#connection-status.badge", ["span.dot"], ["span", "connecting"]],
+                        ],
+                        ["div.progress-shell", {
+                            "role": "progressbar", "aria-label": "Emission progress",
+                            "aria-valuemin": "0", "aria-valuemax": "100",
+                            "aria-valuenow": str(PROCESS_STATE["progress"]),
+                        },
+                            ["div#progress-fill"],
+                            ["div#progress-label", f"{PROCESS_STATE['progress']}%"],
+                        ],
+                        ["div.controls",
+                            ["button#play", {"type": "button", "disabled": "true"}, "▶ Play live feed"],
+                            ["button#pause", {"type": "button"}, "Ⅱ Pause feed"],
+                            ["span.note",
+                             "Play/pause only affect this browser feed — they do not run or stop emission. "
+                             "The server emits at each epoch boundary; status above is that process."],
+                        ],
+                    ],
+                    ["section.panel",
+                        ["div.status-row",
+                            ["strong", "Council readiness"],
+                            ["div.badge" + (".live" if key_ok else ".warn"),
+                                ["span.dot"],
+                                ["span", "OpenRouter configured" if key_ok else "OpenRouter key missing"],
+                            ],
+                        ],
+                        ["p.note",
+                            (
+                                "Pairwise council ranks every eligible commit."
+                                if key_ok else
+                                "Epochs with two or more eligible commits require OPENROUTER_API_KEY."
+                            )
+                        ],
+                        ["div#council-models.model-list"],
+                    ],
+                    ["section.panel",
+                        ["div.feed-head", ["h2", "event feed"], ["a", {"href": "/sse"}, "raw SSE"]],
+                        ["div#audit-feed"],
                     ],
                 ],
-                ["p.note",
-                    (
-                        "Pairwise council ranks every eligible commit."
-                        if key_ok else
-                        "Epochs with two or more eligible commits require OPENROUTER_API_KEY."
-                    )
+                ["aside.ranking-column",
+                    ["section.panel",
+                        ["div.feed-head",
+                            ["h2", "current commit set"],
+                            ["span.note", "live Rank Centrality order"],
+                        ],
+                        ["p.note",
+                            "Voted is the currently confirmed top-down zip prefix; "
+                            "unvoted remains below the first uncovered adjacent pair."],
+                        ["div#commit-set.commit-set"],
+                    ],
                 ],
-            ],
-            ["section.panel",
-                ["div.feed-head", ["h2", "event feed"], ["a", {"href": "/sse"}, "raw SSE"]],
-                ["div#audit-feed"],
             ],
             ["p", ["a", {"href": "/"}, "← constitution"], " · ",
                   ["a", {"href": "/epochs"}, "epochs"], " · ",
