@@ -102,6 +102,32 @@ Application code selects these paths directly. `append_evidence` is intentionall
 narrow: it exists because canonical append, chain head, blobs, and all secondary
 indexes must change atomically.
 
-New patch/prompt/request/response/diff bytes are stored once under their SHA-256.
-Imported legacy envelopes remain unchanged with embedded base64. Detail and
-download routes resolve either representation transparently.
+Patch/prompt/request/response/diff bytes are stored once under their SHA-256,
+including recursively nested fields in imported Evidence and GitDiscovery
+rows. The JSONL tape remains unchanged and byte-authoritative. Its event IDs,
+chain links, entity IDs, and semantic values are preserved, while RocksDB's
+canonical and indexed copies use compact blob references. Detail/download
+routes resolve either representation transparently; epoch cards never fetch
+blob values.
+
+## Rebuilding a flawed projection
+
+The first-boot importer intentionally skips a nonempty database, so it cannot
+repair an older projection containing embedded base64. During maintenance,
+with the application fully stopped and `DISABLE_EPOCH_LOOP=1`:
+
+```sh
+mv /data/constitution.rocks /data/constitution.rocks.pre-blob-refs
+python scripts/import-ledger.py \
+  /data/ledger.jsonl \
+  /data/constitution.rocks \
+  --batch-size 100
+```
+
+Do not use `--force` here: retaining the closed old directory makes rollback
+immediate. Start the application still paused, verify health count/chain and
+representative epoch, comparison, commit, patch, prompt, and attempt routes,
+then unpause. If import or verification fails, stop, remove the incomplete new
+directory if present, move `.pre-blob-refs` back to
+`/data/constitution.rocks`, and restart the prior image while remaining
+paused.

@@ -109,7 +109,9 @@ def test_streaming_import_preserves_contract_and_direct_indexes(tmp_path, monkey
     monkeypatch.setattr(c, "state_db", db)
     try:
         assert c.ROOT.events.len(db) == len(rows)
-        assert c.ROOT.events.get(db, 1) == rows[1]
+        stored_row = c.ROOT.events.get(db, 1)
+        assert stored_row["event_id"] == rows[1]["event_id"]
+        assert stored_row["previous_event_sha256"] == rows[1]["previous_event_sha256"]
         assert c.find_evidence("ev_commit").payload["commit_id"] == "c_imported"
         assert (
             c.find_evidence_payload(
@@ -121,12 +123,19 @@ def test_streaming_import_preserves_contract_and_direct_indexes(tmp_path, monkey
         assert [row.event_id for row in judgments] == ["ev_judgment"]
         assert c._emission_for_epoch(0).ranking == {"alice": "1"}
 
-        # Imported legacy envelope is byte-for-byte equivalent and remains
-        # transparently downloadable without conversion to a blob reference.
+        # The immutable tape remains byte-authoritative. Its identity and
+        # hardlinks survive projection compaction while heavy bytes move once.
         imported = c.find_evidence("ev_commit")
-        assert imported.payload["patch"] == rows[1]["payload"]["patch"]
+        assert imported.event_id == rows[1]["event_id"]
+        assert imported.payload["patch"] == {
+            "encoding": "blob",
+            "sha256": c._sha256_hex(patch),
+            "byte_length": len(patch),
+        }
         response = asyncio.run(c.commit_patch_download("c_imported"))
         assert response.body == patch
+        prompt = asyncio.run(c.comparison_prompt_download("cmp_imported"))
+        assert prompt.body == b"which is better?"
 
         # Runtime selectors do not consult the archival tape.
         tape.unlink()
@@ -139,6 +148,125 @@ def test_streaming_import_preserves_contract_and_direct_indexes(tmp_path, monkey
             "ev_commit",
             "ev_comparison",
         ]
+    finally:
+        db.close()
+
+
+def test_import_externalizes_nested_discovery_and_attempt_blobs(
+    tmp_path, monkeypatch
+):
+    tape = tmp_path / "nested.jsonl"
+    rocks = tmp_path / "nested.rocks"
+    patch = b"nested discovery patch"
+    request = b'{"messages":["large request"]}'
+    response = b'{"choices":["large response"]}'
+    discovery = {
+        "type": "gitdiscovery",
+        "schema_version": 1,
+        "epoch": 4,
+        "snapshot_id": "snap-nested",
+        "timestamp_ms": 1,
+        "config_digest": "cfg",
+        "initial_snapshot": False,
+        "configuration": {},
+        "repositories": [],
+        "observations": [{"oid": "sha1:abc", "patch": c._bytes_blob(patch)}],
+        "commits": [{"oid": "sha1:abc", "patch": c._bytes_blob(patch)}],
+    }
+    attempt = {
+        "type": "evidence",
+        "schema_version": 2,
+        "event_id": "ev_attempt",
+        "epoch": 4,
+        "kind": "llm.attempt_finished",
+        "recorded_at_ms": 2,
+        "previous_event_sha256": c._chain_digest(discovery),
+        "payload": {
+            "attempt_id": "att-nested",
+            "comparison_id": "cmp-nested",
+            "request": c._bytes_blob(request),
+            "response": c._bytes_blob(response),
+        },
+    }
+    tape.write_text(
+        json.dumps(discovery, separators=(",", ":")) + "\n"
+        + json.dumps(attempt, separators=(",", ":")) + "\n"
+    )
+
+    c.import_jsonl_tape(tape, rocks)
+    db = c.RocksDb.open(rocks)
+    monkeypatch.setattr(c, "state_db", db)
+    try:
+        stored_discovery = c.ROOT.discoveries_by_epoch.key(4).get(db)
+        observation_ref = stored_discovery["observations"][0]["patch"]
+        commit_ref = stored_discovery["commits"][0]["patch"]
+        assert observation_ref == commit_ref
+        assert observation_ref["encoding"] == "blob"
+        assert c.ROOT.blobs.key(observation_ref["sha256"]).get(db) == patch
+        hydrated = c._discovery_for_epoch(4)
+        assert hydrated.observations[0]["patch"] == patch.decode()
+
+        stored_attempt = c.find_evidence("ev_attempt")
+        assert stored_attempt.event_id == attempt["event_id"]
+        assert stored_attempt.payload["request"]["encoding"] == "blob"
+        assert stored_attempt.payload["response"]["encoding"] == "blob"
+        assert (
+            asyncio.run(c.attempt_blob_download("att-nested", "request")).body
+            == request
+        )
+        assert (
+            asyncio.run(c.attempt_blob_download("att-nested", "response")).body
+            == response
+        )
+    finally:
+        db.close()
+
+
+def test_large_imported_patch_is_not_decoded_by_epoch_or_detail_cards(
+    tmp_path, monkeypatch
+):
+    tape = tmp_path / "large.jsonl"
+    rocks = tmp_path / "large.rocks"
+    rows, _ = _sample_tape(tape)
+    patch = b"diff --git a/x b/x\n" + b"+" * (8 * 1024 * 1024)
+    rows[1]["payload"]["patch"] = c._bytes_blob(patch)
+    rows[2]["payload"]["side_a"]["diff"] = c._bytes_blob(patch)
+    rows[2]["payload"]["side_b"]["diff"] = c._bytes_blob(patch)
+    with tape.open("w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    c.import_jsonl_tape(tape, rocks)
+    db = c.RocksDb.open(rocks)
+    monkeypatch.setattr(c, "state_db", db)
+    original_decode = c._decode_blob
+    decoded_refs = []
+
+    def record_ref_decodes(value):
+        if value and value.get("encoding") == "blob":
+            decoded_refs.append(value["sha256"])
+        return original_decode(value)
+
+    monkeypatch.setattr(c, "_decode_blob", record_ref_decodes)
+    try:
+        stored = c.ROOT.evidence_by_id.key("ev_commit").get(db)
+        assert len(json.dumps(stored)) < 4_000
+        assert c.ROOT.blobs.len(db) == 2  # patch/diffs dedupe, plus prompt
+
+        epoch_response = asyncio.run(c.epoch_detail(1))
+        commit_response = asyncio.run(c.commit_detail("c_imported"))
+        comparison_response = asyncio.run(c.comparison_detail("cmp_imported"))
+        assert len(epoch_response.body) < 1_000_000
+        assert len(commit_response.body) < 1_000_000
+        assert len(comparison_response.body) < 1_000_000
+        assert decoded_refs == []
+
+        assert asyncio.run(c.commit_patch_download("c_imported")).body == patch
+        assert decoded_refs == [c._sha256_hex(patch)]
+        assert (
+            asyncio.run(c.comparison_diff_download("cmp_imported", "a")).body
+            == patch
+        )
     finally:
         db.close()
 

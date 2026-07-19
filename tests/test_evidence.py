@@ -79,7 +79,8 @@ def test_html_evidence_pages_escape_and_link(evidence_store):
     }))
     commit_html = asyncio.run(c.commit_detail(commit_id)).body.decode()
     assert "<script>evil()" not in commit_html
-    assert "&lt;script&gt;evil()" in commit_html
+    assert "&lt;script&gt;evil()" not in commit_html
+    assert "msg &lt;b&gt;x&lt;/b&gt;" in commit_html
     assert f"/commits/{commit_id}/patch" in commit_html
     epoch_html = asyncio.run(c.epoch_detail(3)).body.decode()
     assert f"/commits/{commit_id}" in epoch_html

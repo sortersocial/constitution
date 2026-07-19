@@ -277,7 +277,7 @@ class Evidence:
 
 
 # Direct application schema. Paths are the query/mutation interface; values are
-# plain dictionaries compatible with the unchanged JSONL/CBOR tape contract.
+# plain dictionaries. JSONL is authoritative; projected heavy values use refs.
 STATE = Record(
     events=List(Leaf()),                         # canonical tape order
     evidence_by_id=Map(Leaf()),                  # event_id -> evidence dict
@@ -422,7 +422,7 @@ _HEAVY_BLOB_FIELDS = {"patch", "prompt", "request", "response", "diff"}
 
 
 def _externalize_payload(payload: dict) -> tuple[dict, list[tuple[str, bytes]]]:
-    """Externalize new heavy fields recursively; imported envelopes stay intact."""
+    """Replace recursively nested heavy fields with content-addressed refs."""
     blobs: list[tuple[str, bytes]] = []
 
     def walk(value, field: str | None = None):
@@ -527,7 +527,12 @@ _ENTITY_FIELDS = (
 )
 
 
-def _event_writes(row: dict, *, blobs: list[tuple[str, bytes]] | None = None) -> list:
+def _event_writes(
+    row: dict,
+    *,
+    blobs: list[tuple[str, bytes]] | None = None,
+    chain_digest: str | None = None,
+) -> list:
     """Lower one tape row to canonical storage plus all direct indexes."""
     writes = [ROOT.events.push(row)]
     event_type = row.get("type")
@@ -618,7 +623,7 @@ def _event_writes(row: dict, *, blobs: list[tuple[str, bytes]] | None = None) ->
                     ROOT.canonical_patch_oids.key(patch_identity).set(canonical_oid)
                 )
 
-    digest = _chain_digest(row)
+    digest = chain_digest if chain_digest is not None else _chain_digest(row)
     if digest:
         writes.append(ROOT.meta.chain_head.set(digest))
     for sha, raw in blobs or []:
@@ -743,6 +748,7 @@ def import_jsonl_tape(
     pending_evidence_ids: set[str] = set()
     pending_emission_epochs: set[int] = set()
     pending_discovery_epochs: set[int] = set()
+    pending_blob_bytes = 0
     try:
         with tape_path.open("rb") as tape:
             for line_number, raw_line in enumerate(tape, start=1):
@@ -806,13 +812,22 @@ def import_jsonl_tape(
                 chain = _chain_digest(row)
                 if chain:
                     expected["chain_head"] = chain
-                batch.extend(_event_writes(row))
+                stored_row, blobs = _externalize_payload(row)
+                pending_blob_bytes += sum(len(raw) for _, raw in blobs)
+                batch.extend(
+                    _event_writes(
+                        stored_row,
+                        blobs=blobs,
+                        chain_digest=chain,
+                    )
+                )
                 expected["event_count"] += 1
                 pending += 1
-                if pending >= batch_size:
+                if pending >= batch_size or pending_blob_bytes >= 16 * 1024 * 1024:
                     batch.commit(Durability.WAL_ONLY)
                     batch = db.batch()
                     pending = 0
+                    pending_blob_bytes = 0
                     pending_evidence_ids.clear()
                     pending_emission_epochs.clear()
                     pending_discovery_epochs.clear()
@@ -3299,8 +3314,8 @@ async def commit_detail(commit_id: str):
         _pre_blob(_blob_text(p.get("message")), cls="blob compact"),
         ["h2", "comparisons involving this commit"],
         *(related_cmp if related_cmp else [["p.note", "None yet."]]),
-        _fold("Full patch",
-              _pre_blob(_blob_text(p.get("patch")))),
+        ["p.note", "The full patch is loaded only by the download route: ",
+         _a(f"/commits/{commit_id}/patch", "download patch")],
         _fold("Metadata", _dl_rows([
             ("commit_id", commit_id),
             ("patch_sha256", p.get("patch_sha256")),
@@ -3383,8 +3398,10 @@ async def comparison_detail(comparison_id: str):
                      if cid_a else _side_label(side_a))],
                 ["h4", "message"],
                 _pre_blob(_blob_text(side_a.get("message")), cls="blob compact"),
-                _fold("Full diff A",
-                      _pre_blob(_blob_text(side_a.get("diff")))),
+                ["p", _a(
+                    f"/comparisons/{comparison_id}/diff/a",
+                    "download full diff A",
+                )],
             ],
             ["section.side",
                 ["h3", "B — ",
@@ -3392,8 +3409,10 @@ async def comparison_detail(comparison_id: str):
                      if cid_b else _side_label(side_b))],
                 ["h4", "message"],
                 _pre_blob(_blob_text(side_b.get("message")), cls="blob compact"),
-                _fold("Full diff B",
-                      _pre_blob(_blob_text(side_b.get("diff")))),
+                ["p", _a(
+                    f"/comparisons/{comparison_id}/diff/b",
+                    "download full diff B",
+                )],
             ],
         ],
         _fold("Hardlinks — judgments / attempts / prompt",
@@ -3402,8 +3421,7 @@ async def comparison_detail(comparison_id: str):
               _link_list(judgment_links) if judgment_links else ["p.note", "(none)"],
               ["h3", "attempts"],
               _link_list(attempt_links) if attempt_links else ["p.note", "(none)"],
-              _fold("Full prompt text",
-                    _pre_blob(_blob_text(p.get("prompt")))),
+              ["p.note", "Prompt text is loaded only by the download route."],
         ),
     ])
 
@@ -3419,6 +3437,24 @@ async def comparison_prompt_download(comparison_id: str):
         media_type="text/plain; charset=utf-8",
         headers={
             "Content-Disposition": f'attachment; filename="{comparison_id}.prompt.txt"'
+        },
+    )
+
+
+@app.get("/comparisons/{comparison_id}/diff/{side}")
+async def comparison_diff_download(comparison_id: str, side: str):
+    ev = find_evidence_payload("comparison.input", "comparison_id", comparison_id)
+    if not ev or side not in {"a", "b"}:
+        return PlainTextResponse("not found", status_code=404)
+    value = (ev.payload.get(f"side_{side}") or {}).get("diff")
+    raw = _decode_blob(value) if isinstance(value, dict) else str(value or "").encode()
+    return Response(
+        content=raw,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{comparison_id}-{side}.diff"'
+            )
         },
     )
 
@@ -3468,11 +3504,37 @@ async def attempt_detail(attempt_id: str):
                  judgment.payload["judgment_id"],
              ) if judgment and judgment.payload.get("judgment_id") else None),
         ]),
-        ["h2", "request"],
-        _pre_blob(_blob_text(p.get("request"))),
-        ["h2", "response"],
-        _pre_blob(_blob_text(p.get("response"))),
+        ["h2", "request / response"],
+        ["p",
+         _a(f"/attempts/{attempt_id}/request", "download request"),
+         " · ",
+         _a(f"/attempts/{attempt_id}/response", "download response")],
     ])
+
+
+@app.get("/attempts/{attempt_id}/{part}")
+async def attempt_blob_download(attempt_id: str, part: str):
+    if part not in {"request", "response"}:
+        return PlainTextResponse("not found", status_code=404)
+    started = find_evidence_payload("llm.attempt_started", "attempt_id", attempt_id)
+    finished = find_evidence_payload("llm.attempt_finished", "attempt_id", attempt_id)
+    if not started and not finished:
+        return PlainTextResponse("not found", status_code=404)
+    payload = {
+        **(started.payload if started else {}),
+        **(finished.payload if finished else {}),
+    }
+    value = payload.get(part)
+    raw = _decode_blob(value) if isinstance(value, dict) else str(value or "").encode()
+    return Response(
+        content=raw,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{attempt_id}-{part}.txt"'
+            )
+        },
+    )
 
 
 @app.get("/judgments/{judgment_id}")
