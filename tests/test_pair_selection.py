@@ -14,7 +14,9 @@ progress_fn(event: dict) -> None
 """
 
 import asyncio
+import time
 import pytest
+import constitution as c
 from constitution import UnionFind, pairwise_rank, rank_centrality
 
 
@@ -351,6 +353,37 @@ def test_cached_comparisons_yield_to_other_event_loop_work():
         return heartbeat_ticks
 
     assert run(scenario()) >= 19
+
+
+def test_rank_centrality_solve_runs_off_the_event_loop(monkeypatch):
+    original = c.rank_centrality
+
+    def slow_rank_centrality(pairs):
+        time.sleep(0.05)
+        return original(pairs)
+
+    monkeypatch.setattr(c, "rank_centrality", slow_rank_centrality)
+
+    async def scenario():
+        heartbeat_ticks = 0
+        ranking_done = False
+
+        async def cached_compare(i, j):
+            return [(min(i, j), max(i, j), 2.0, 1.0)]
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not ranking_done:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0.001)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        await c.pairwise_rank(3, cached_compare)
+        ranking_done = True
+        await heartbeat_task
+        return heartbeat_ticks
+
+    assert run(scenario()) >= 5
 
 
 # ---------------------------------------------------------------------------

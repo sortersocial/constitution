@@ -1264,7 +1264,7 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
     # There is exactly one logical pass; step is how far down the ranking we
     # had to scan to find the first uncovered adjacent pair (1 = top of zip).
     while True:
-        scores = rank_centrality(pairs)
+        scores = await asyncio.to_thread(rank_centrality, pairs)
         ranking = sorted(range(n), key=lambda idx: scores[idx], reverse=True)
 
         target = None
@@ -2462,7 +2462,7 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
     if not pairs:
         commit_score_list = [Decimal("1")]
     else:
-        scores = rank_centrality(pairs)
+        scores = await asyncio.to_thread(rank_centrality, pairs)
         commit_score_list = [Decimal(str(scores[i])) for i in range(len(ordered))]
 
     commit_ranking = {
