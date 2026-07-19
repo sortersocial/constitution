@@ -458,6 +458,7 @@ def test_same_contributor_multiple_commits_runs_pairwise(
     discovery_config, monkeypatch,
 ):
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+    monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
     calls = {"n": 0}
 
     async def models(n=3):
@@ -515,6 +516,7 @@ def test_same_contributor_multiple_commits_runs_pairwise(
 
 def test_all_council_failures_abort_ranking(discovery_config, monkeypatch):
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+    monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
 
     async def models(n=3):
         return ["broken"]
@@ -540,6 +542,7 @@ def test_all_council_failures_abort_ranking(discovery_config, monkeypatch):
 
 def test_one_council_failure_retires_model_and_continues(discovery_config, monkeypatch):
     monkeypatch.setattr(c, "store", c.JsonlStore(discovery_config / "ledger.jsonl"))
+    monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
 
     async def models(n=3):
         return ["broken", "solid"]

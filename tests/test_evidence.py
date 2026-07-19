@@ -101,6 +101,21 @@ def test_pairwise_prompt_rejects_patch_theater():
     assert "line count" in prompt
 
 
+def test_preferred_council_includes_latest_grok_and_sonnet():
+    models = c._with_preferred_council(["openai/gpt-chat-latest"])
+    assert models[0] == "~anthropic/claude-sonnet-latest"
+    assert models[1] == "~x-ai/grok-latest"
+    assert "openai/gpt-chat-latest" in models
+
+
+def test_parse_pairwise_json_tolerates_markdown_fence():
+    result = c._parse_pairwise_json(
+        '```json\n{"winner": "B", "ratio": "3:1", "explanation": "ok"}\n```'
+    )
+    assert result["winner"] == "B"
+    assert result["ratio"] == "3:1"
+
+
 def test_epoch_page_surfaces_council_disagreements(evidence_store):
     cmp_id = "cmp_disagree"
     asyncio.run(c.append_evidence(2, "comparison.input", {
@@ -165,6 +180,7 @@ def test_comparison_page_shows_reasoning_inline(evidence_store):
 
 def test_ranking_resume_skips_duplicate_provider_calls(evidence_store, monkeypatch):
     calls = {"n": 0}
+    monkeypatch.setattr(c, "PREFERRED_COUNCIL_MODELS", [])
 
     async def models(n=3):
         return ["mock/a", "mock/b", "mock/c"]

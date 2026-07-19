@@ -188,11 +188,23 @@ GIT_MIRROR_DIR = pathlib.Path(os.environ.get("GIT_MIRROR_DIR", "/data/git"))
 GIT_TIMEOUT_SECONDS = int(os.environ.get("GIT_TIMEOUT_SECONDS", "120"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
-# Council model IDs: slug.social garden rank under this parent (bodies = OpenRouter URLs), then top-up from OpenRouter list.
+# Council model IDs: always include preferred seats, then slug.social garden rank
+# under this parent (bodies = OpenRouter URLs), then top-up from OpenRouter list.
 SLUG_SOCIAL_BASE_URL = os.environ.get("SLUG_SOCIAL_BASE_URL", "https://slug.social").rstrip("/")
 SLUG_MODEL_RANK_PARENT = os.environ.get(
     "SLUG_MODEL_RANK_PARENT", "slug/token/commit-ranking/model"
 ).strip()
+# OpenRouter "~…/…-latest" aliases resolve to the newest concrete model in-family.
+DEFAULT_PREFERRED_COUNCIL_MODELS = [
+    "~anthropic/claude-sonnet-latest",
+    "~x-ai/grok-latest",
+]
+PREFERRED_COUNCIL_MODELS = json.loads(
+    os.environ.get(
+        "PREFERRED_COUNCIL_MODELS_JSON",
+        json.dumps(DEFAULT_PREFERRED_COUNCIL_MODELS),
+    )
+)
 
 
 # ===========================================================================
@@ -854,24 +866,82 @@ async def _fetch_models_openrouter_only(
     return out
 
 
+def _preferred_council_models() -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for model_id in PREFERRED_COUNCIL_MODELS or []:
+        mid = str(model_id).strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
+
+
+def _with_preferred_council(models: list[str]) -> list[str]:
+    """Preferred seats first, then any additional council members."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for model_id in _preferred_council_models() + list(models):
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        out.append(model_id)
+    return out
+
+
 async def fetch_top_models(n=3):
+    preferred = _preferred_council_models()
+    target = max(n, len(preferred))
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(60.0, connect=15.0)
     ) as client:
-        got: list[str] = []
-        if SLUG_MODEL_RANK_PARENT:
+        got: list[str] = list(preferred)
+        exclude = set(got)
+        if len(got) < target and SLUG_MODEL_RANK_PARENT:
             try:
-                got = await _fetch_models_from_slug_rank_parent(
-                    client, SLUG_MODEL_RANK_PARENT, n
+                from_slug = await _fetch_models_from_slug_rank_parent(
+                    client, SLUG_MODEL_RANK_PARENT, target - len(got)
                 )
+                for mid in from_slug:
+                    if mid in exclude:
+                        continue
+                    got.append(mid)
+                    exclude.add(mid)
+                    if len(got) >= target:
+                        break
             except Exception:
-                got = []
-        if len(got) < n and (OPENROUTER_API_KEY or "").strip():
+                pass
+        if len(got) < target and (OPENROUTER_API_KEY or "").strip():
             rest = await _fetch_models_openrouter_only(
-                client, n - len(got), exclude=set(got)
+                client, target - len(got), exclude=exclude
             )
             got.extend(rest)
-        return got[:n]
+        return _with_preferred_council(got)[:target]
+
+
+def _parse_pairwise_json(content: str) -> dict:
+    """Parse council JSON; tolerate markdown fences and leading prose."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+        if text.lower().startswith("json"):
+            text = text[4:].lstrip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        result = json.loads(text[start : end + 1])
+    if not isinstance(result, dict):
+        raise ValueError("pairwise response must be a JSON object")
+    return result
 
 
 def _retry_llm_pairwise(exc: BaseException) -> bool:
@@ -934,7 +1004,7 @@ async def llm_pairwise_compare(
             raw_response = resp.content
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]
-            result = json.loads(content)
+            result = _parse_pairwise_json(content)
             if result.get("winner") not in {"A", "B"}:
                 raise ValueError("winner must be A or B")
             ratio_parts = str(result["ratio"]).split(":")
@@ -1642,6 +1712,8 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
     models = _find_ranking_models(ranking_run_id)
     if models is None:
         models = await fetch_top_models(n=3)
+    # Preferred seats always sit (incl. resume of runs that predate them).
+    models = _with_preferred_council(models)
     if not models:
         raise RuntimeError("no council models available for commit ranking")
     await append_evidence(epoch, "ranking.started", {
