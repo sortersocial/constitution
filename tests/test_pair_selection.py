@@ -329,6 +329,30 @@ def test_progress_no_duplicate_spanning_steps():
     assert spanning_steps == sorted(set(spanning_steps))
 
 
+def test_cached_comparisons_yield_to_other_event_loop_work():
+    async def scenario():
+        heartbeat_ticks = 0
+        ranking_done = False
+
+        async def cached_compare(i, j):
+            # Deliberately contains no await, matching a RocksDB cache hit.
+            return [(min(i, j), max(i, j), 2.0, 1.0)]
+
+        async def heartbeat():
+            nonlocal heartbeat_ticks
+            while not ranking_done:
+                heartbeat_ticks += 1
+                await asyncio.sleep(0)
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        await pairwise_rank(20, cached_compare)
+        ranking_done = True
+        await heartbeat_task
+        return heartbeat_ticks
+
+    assert run(scenario()) >= 19
+
+
 # ---------------------------------------------------------------------------
 # rank_centrality accumulates (no overwrite bug)
 # ---------------------------------------------------------------------------

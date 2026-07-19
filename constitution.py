@@ -1238,6 +1238,9 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
         results = await compare_fn(i, j)
         pairs.extend(results)
         compared.add(frozenset((i, j)))
+        # Resumed comparisons may be satisfied entirely from RocksDB without
+        # an I/O await. Yield explicitly so ranking never starves HTTP/SSE.
+        await asyncio.sleep(0)
         return results
 
     # --- Phase 1: spanning tree ---
