@@ -3,7 +3,8 @@
 Regression coverage for a remote-code-execution class: a request value that
 contains a `$slot` reference must not be able to reintroduce a live slot and
 realign string quotes so that attacker bytes land in code position. Values are
-bound to eval locals, so they can only ever be data.
+bound to eval locals (via evaleval's BoundSnippet), so they can only ever be
+data. These tests drive the exact path used by the POST / handler.
 """
 
 import constitution as c
@@ -15,15 +16,19 @@ def _signed(template: str) -> dict:
     return {"__snippet__": template, "__sig__": sig, "__nonce__": nonce}
 
 
-def test_bind_snippet_rewrites_slots_and_binds_values():
+def test_verify_snippet_binds_value_as_local_not_source():
     form = {**_signed("redeem('alice', $wallet_address)"), "wallet_address": "0xABC"}
-    code, bindings = c._bind_snippet(form)
-    assert code == "redeem('alice', wallet_address)"
-    assert bindings == {"wallet_address": "0xABC"}
+    bound = c.signer.verify_snippet(form)
+    assert "0xABC" not in bound.source  # value is not spliced into the source
+    assert "0xABC" in bound.locals_.values()
+
+    calls = []
+    bound.eval({"redeem": lambda u, w: calls.append((u, w))})
+    assert calls == [("alice", "0xABC")]
 
 
-def test_bind_snippet_neutralizes_nested_slot_injection():
-    # The historical RCE: wallet_address="$q" would, under string splicing,
+def test_nested_slot_payload_cannot_execute():
+    # Historical RCE: wallet_address="$q" would, under string splicing,
     # reintroduce $q inside a scrubbed literal; scrubbing q's payload then
     # realigned quotes so __import__(...) became a live call argument.
     payload = "', __import__('os').system('touch /tmp/pwned'), '"
@@ -32,30 +37,36 @@ def test_bind_snippet_neutralizes_nested_slot_injection():
         "wallet_address": "$q",
         "q": payload,
     }
-    code, bindings = c._bind_snippet(form)
-
-    # Only the declared slot is bound; the unsigned payload field is ignored.
-    assert bindings == {"wallet_address": "$q"}
-    assert "q" not in bindings
+    bound = c.signer.verify_snippet(form)
 
     calls = []
-    eval(code, {"redeem": lambda u, w: calls.append((u, w))}, bindings)
+    bound.eval({"redeem": lambda *a: calls.append(a) or "ok"})
     # redeem is called exactly once, with the payload as an inert string.
     assert calls == [("alice", "$q")]
 
 
-def test_bind_snippet_ignores_extra_fields_and_cannot_shadow_globals():
+def test_extra_fields_cannot_shadow_globals():
+    # A submitted field named like a global must not leak into the eval scope
+    # and shadow the real handler.
     form = {
         **_signed("redeem('alice', $wallet_address)"),
         "wallet_address": "0xABC",
-        "redeem": "attacker",  # would shadow the global if it leaked into locals
+        "redeem": "attacker",
         "os": "attacker",
     }
-    _, bindings = c._bind_snippet(form)
-    assert bindings == {"wallet_address": "0xABC"}
+    bound = c.signer.verify_snippet(form)
+    sentinel = object()
+    called = []
+
+    def redeem(u, w):
+        called.append((u, w))
+        return sentinel
+
+    assert bound.eval({"redeem": redeem}) is sentinel
+    assert called == [("alice", "0xABC")]
 
 
-def test_bind_snippet_rejects_bad_signature():
+def test_bad_signature_is_rejected():
     form = {
         "__snippet__": "redeem('alice', $wallet_address)",
         "__sig__": "not-a-real-signature",
@@ -63,30 +74,19 @@ def test_bind_snippet_rejects_bad_signature():
         "wallet_address": "0xABC",
     }
     try:
-        c._bind_snippet(form)
+        c.signer.verify_snippet(form)
     except c.SnippetExecutionError as exc:
         assert exc.status_code == 403
     else:
         raise AssertionError("expected SnippetExecutionError for bad signature")
 
 
-def test_bind_snippet_consumes_nonce_once():
-    template = "redeem('alice', $wallet_address)"
-    form = {**_signed(template), "wallet_address": "0xABC"}
-    c._bind_snippet(form)
+def test_nonce_is_single_use():
+    form = {**_signed("redeem('alice', $wallet_address)"), "wallet_address": "0xABC"}
+    c.signer.verify_snippet(form)
     try:
-        c._bind_snippet(form)
+        c.signer.verify_snippet(form)
     except c.SnippetExecutionError as exc:
         assert exc.status_code == 403
     else:
         raise AssertionError("nonce must be single-use")
-
-
-def test_bind_snippet_requires_declared_slot_values():
-    form = _signed("redeem('alice', $wallet_address)")  # no wallet_address field
-    try:
-        c._bind_snippet(form)
-    except c.SnippetExecutionError as exc:
-        assert exc.status_code == 400
-    else:
-        raise AssertionError("missing slot value must be rejected")

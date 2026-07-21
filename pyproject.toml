@@ -3,7 +3,7 @@ name = "slug-constitution"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "evaleval @ git+https://github.com/tommy-mor/evaleval.git@584225b43f37261b446ad04169aaddf77ca6c201",
+    "evaleval @ git+https://github.com/tommy-mor/evaleval.git@e330d82a7e813e59b7e594f4c990a6c66d8fb0c2",
     "rocksdict>=0.3.29",
     "numpy",
     "httpx",
