@@ -281,7 +281,7 @@ wheels = [
 [[package]]
 name = "evaleval"
 version = "0.4.0"
-source = { git = "https://github.com/tommy-mor/evaleval.git?rev=584225b43f37261b446ad04169aaddf77ca6c201#584225b43f37261b446ad04169aaddf77ca6c201" }
+source = { git = "https://github.com/tommy-mor/evaleval.git?rev=e330d82a7e813e59b7e594f4c990a6c66d8fb0c2#e330d82a7e813e59b7e594f4c990a6c66d8fb0c2" }
 dependencies = [
     { name = "cbor2" },
     { name = "rocksdict" },
@@ -777,7 +777,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "authlib" },
-    { name = "evaleval", git = "https://github.com/tommy-mor/evaleval.git?rev=584225b43f37261b446ad04169aaddf77ca6c201" },
+    { name = "evaleval", git = "https://github.com/tommy-mor/evaleval.git?rev=e330d82a7e813e59b7e594f4c990a6c66d8fb0c2" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "hypothesis" },

@@ -6,7 +6,7 @@
 #   "uvicorn",
 #   "httpx",
 #   "tenacity",
-#   "evaleval @ git+https://github.com/tommy-mor/evaleval.git@584225b43f37261b446ad04169aaddf77ca6c201",
+#   "evaleval @ git+https://github.com/tommy-mor/evaleval.git@e330d82a7e813e59b7e594f4c990a6c66d8fb0c2",
 #   "rocksdict>=0.3.29",
 #   "authlib",
 #   "itsdangerous",
@@ -4621,8 +4621,9 @@ async def index(request: Request):
 async def do(request: Request):
     form = await request.form()
     try:
-        snippet = signer.verify_snippet(form)
-        result = eval(snippet)
+        # verify_snippet binds each $slot's value as an eval local rather than
+        # splicing it into the source, so request data can never become code.
+        result = signer.verify_snippet(form).eval(globals())
         if asyncio.iscoroutine(result):
             result = await result
         return result
