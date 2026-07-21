@@ -4617,12 +4617,45 @@ async def index(request: Request):
     ])
 
 
+_SNIPPET_SLOT = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _bind_snippet(form) -> tuple[str, dict[str, str]]:
+    """Verify a signed snippet and bind its $slots as eval locals.
+
+    The signed template is authored by the server; only its declared $slots are
+    data. Rather than splice request values into the source string (where a
+    value like "$other" could reintroduce a live slot and realign quotes into
+    code position), each $slot becomes a bare name and its value is bound for
+    eval's locals. Values are therefore never parsed as code.
+    """
+    snippet = str(form.get("__snippet__", ""))
+    sig = str(form.get("__sig__", ""))
+    nonce = str(form.get("__nonce__", ""))
+    if not all([snippet, sig, nonce]):
+        raise SnippetExecutionError("Missing fields", status_code=400)
+    if not signer.verify(snippet, nonce, sig):
+        raise SnippetExecutionError("Invalid signature", status_code=403)
+    if not signer.consume_nonce(nonce):
+        raise SnippetExecutionError("Invalid nonce", status_code=403)
+
+    form_data = {k: str(v) for k, v in form.items() if not k.startswith("__")}
+    slots = set(_SNIPPET_SLOT.findall(snippet))
+    missing = slots - form_data.keys()
+    if missing:
+        raise SnippetExecutionError(
+            f"missing slot(s): {sorted(missing)}", status_code=400
+        )
+    code = _SNIPPET_SLOT.sub(r"\1", snippet)
+    return code, {name: form_data[name] for name in slots}
+
+
 @app.post("/")
 async def do(request: Request):
     form = await request.form()
     try:
-        snippet = signer.verify_snippet(form)
-        result = eval(snippet)
+        code, bindings = _bind_snippet(form)
+        result = eval(code, globals(), bindings)
         if asyncio.iscoroutine(result):
             result = await result
         return result
