@@ -3,3 +3,4 @@ repomix-output.xml
 slug_constitution.egg-info/
 de440s.bsp
 *.json
+experiments/pairsel/target/
