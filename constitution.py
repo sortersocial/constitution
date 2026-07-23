@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
-import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl, base64
+import json, time, os, asyncio, httpx, pathlib, subprocess, hashlib, re, fcntl, base64, random
 import sympy as sp  # type: ignore[reportMissingImports]
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from evaleval import (
@@ -1147,6 +1147,23 @@ import numpy as np
 
 
 def rank_centrality(pairs):
+    """Stationary distribution of the comparison chain (Negahban-Oh-Shah).
+
+    The transition matrix follows eq. (4) of the paper: pairwise win
+    fractions scaled by the maximum degree (number of distinct opponents),
+    not by the maximum row sum. Row-sum scaling strips the self-loops the
+    aperiodicity argument relies on — balanced graphs turn periodic and
+    oscillate, and everything else mixes catastrophically slowly, which
+    made truncated power iteration return scores compressed toward
+    uniform (manufacturing phantom near-ties). Both scalings share the
+    same stationary distribution when the chain is irreducible; degree
+    scaling makes it actually reachable.
+
+    The stationary vector is computed by an exact linear solve; power
+    iteration remains as the fallback for reducible (disconnected)
+    comparison graphs, where the solve is singular and the uniform
+    starting vector decides how mass splits across components.
+    """
     items = set()
     for w, l, wr, lr in pairs:
         items.add(w)
@@ -1157,43 +1174,81 @@ def rank_centrality(pairs):
         W[l][w] += wr   # A[loser][winner] = preference for winner over loser
         W[w][l] += lr   # A[winner][loser] = preference for loser over winner
     P = np.zeros((n, n))
+    degree = np.zeros(n)
     for i in range(n):
         for j in range(n):
             if W[i][j] + W[j][i] > 0:
                 P[i][j] = W[i][j] / (W[i][j] + W[j][i])
-    w_max = max(P.sum(axis=1)) or 1
-    P = P / w_max
+                degree[i] += 1
+    d_max = degree.max() or 1
+    P = P / d_max
     for i in range(n):
         P[i][i] = 1 - P[i].sum()
+    pi = _stationary_solve(n, P)
+    if pi is None:
+        pi = _stationary_power_iteration(n, P)
+    return pi / pi.sum()
+
+
+def _stationary_solve(n, P):
+    """Exact solve of pi P = pi, sum(pi) = 1; None when singular/invalid."""
+    A = P.T - np.eye(n)
+    A[n - 1, :] = 1.0
+    b = np.zeros(n)
+    b[n - 1] = 1.0
+    try:
+        x = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(x)) or np.any(x < -1e-9):
+        return None  # reducible or near-singular chain; let power iteration decide
+    x = np.clip(x, 0.0, None)
+    total = x.sum()
+    if not (np.isfinite(total) and total > 0):
+        return None
+    return x
+
+
+def _stationary_power_iteration(n, P):
     pi = np.ones(n) / n
     for _ in range(10000):
         pi_next = pi @ P
         if np.allclose(pi, pi_next, atol=1e-12):
             break
         pi = pi_next
-    return pi / pi.sum()
+    return pi
 
 
 # ===========================================================================
-# §3b. PAIR SELECTION — spanning tree + zip sort
+# §3b. PAIR SELECTION — explore (matchings) + refine (money-first zip)
 #
-# Two-phase algorithm so we make the minimum useful comparisons:
+# The terminal state is unchanged and remains the certificate of a
+# finished ranking: every adjacent pair in the final ranking has at
+# least one direct LLM comparison ("fully zipped"). What changed is the
+# route to that state, following a 150-replicate calibrated simulation
+# (experiments/pairsel) in which the old route — an OID chain followed
+# by frontier-first zipping — was significantly worse than choosing
+# pairs uniformly at random at equal vote budgets.
 #
-# Phase 1 — spanning tree: union-find, compare only pairs that bridge
-#   disconnected components. Exactly N-1 comparisons for N authors.
+# Phase 1 — explore: three deterministic pseudo-random matching rounds
+#   (seeded by the ranking run id, so restarts replay the same pairs and
+#   resume from cached judgments). The union of the rounds is an
+#   expander-like near-regular graph, which Rank Centrality's error
+#   bound rewards; a union-find pass then bridges any remaining
+#   disconnected components.
 #
-# Phase 2 — zip sort: repeatedly find the first adjacent pair in the
-#   current ranking that has no direct comparison result yet and compare
-#   it.  The ranking is re-derived from scratch before every step, so a
-#   comparison at position k cannot silently skip a newly-adjacent
-#   uncovered pair at position k-1.
-#   Terminates when every adjacent slot in the current ranking already
-#   has at least one LLM-reasoned comparison result.  No pair is ever
-#   compared more than once.
+# Phase 2 — refine: repeatedly compare the first uncovered adjacent
+#   pair in the current ranking whose two commits have DIFFERENT
+#   contributors; same-author adjacent pairs are compared only when no
+#   cross-author pair remains, because same-author ordering cannot move
+#   the payout. The ranking is re-derived before every step. Terminates
+#   fully zipped. No pair is ever compared more than once.
 #
 # Progress is reported in terms of phase/pass/step, not total pairs,
-# because the total is unknown until the zip sort converges.
+# because the total is unknown until the zip converges.
 # ===========================================================================
+
+EXPLORE_MATCHING_ROUNDS = 3
 
 class UnionFind:
     def __init__(self, n: int):
@@ -1222,7 +1277,9 @@ class UnionFind:
         return sum(1 for i in range(len(self._parent)) if self.find(i) == i)
 
 
-async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
+async def pairwise_rank(
+    n: int, compare_fn, progress_fn=None, *, authors=None, seed=None
+) -> list:
     """
     Two-phase pairwise ranking. Returns list of (w, l, wr, lr) pairs
     suitable for rank_centrality().
@@ -1233,6 +1290,14 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
     progress_fn: async (event: dict) -> None  (optional)
       event has keys: phase, step, total, and for zip: pass (always 1).
 
+    authors: optional list mapping item index -> contributor id. When
+      given, the refine phase prioritizes cross-author adjacent pairs
+      (the only ones that can change the payout).
+
+    seed: any hashable value; explore-phase matchings are a pure function
+      of it, so a restarted run replays identical pairs and resumes from
+      cached judgments.
+
     # @b1050ff3-000c-4a8f-8b46-c5ef91d696c7:cursor:anthropic/claude-sonnet-4-5
     """
     if n <= 1:
@@ -1240,52 +1305,89 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
 
     pairs = []
     compared: set = set()  # frozensets of already-compared index pairs
+    touched: set = set()   # items that appear in at least one comparison
 
     async def compare(i, j):
         results = await compare_fn(i, j)
         pairs.extend(results)
         compared.add(frozenset((i, j)))
+        touched.update((i, j))
         # Resumed comparisons may be satisfied entirely from RocksDB without
         # an I/O await. Yield explicitly so ranking never starves HTTP/SSE.
         await asyncio.sleep(0)
         return results
 
-    # --- Phase 1: spanning tree ---
+    # --- Phase 1a: explore — deterministic pseudo-random matchings ---
+    rng = random.Random(f"pairwise-rank|{seed}")
+    planned = []
+    for _ in range(EXPLORE_MATCHING_ROUNDS):
+        order = list(range(n))
+        rng.shuffle(order)
+        planned.extend(zip(order[0::2], order[1::2]))
+
+    step = 0
     uf = UnionFind(n)
-    for i in range(n - 1):
-        if not uf.connected(i, i + 1):
-            await compare(i, i + 1)
-            uf.union(i, i + 1)
+    for a, b in planned:
+        if frozenset((a, b)) in compared:
+            continue
+        await compare(a, b)
+        uf.union(a, b)
+        step += 1
         if progress_fn:
             await progress_fn({
                 "phase": "spanning_tree",
-                "step": i + 1,
-                "total": n - 1,
+                "step": step,
+                "total": len(planned),
                 "ranking": list(range(n)),
-                "voted_count": i + 2,
+                "voted_count": len(touched),
             })
 
-    # --- Phase 2: zip sort ---
+    # --- Phase 1b: bridge any components the matchings left apart ---
+    for i in range(n - 1):
+        if uf.connected(i, i + 1):
+            continue
+        await compare(i, i + 1)
+        uf.union(i, i + 1)
+        step += 1
+        if progress_fn:
+            await progress_fn({
+                "phase": "spanning_tree",
+                "step": step,
+                "total": len(planned),
+                "ranking": list(range(n)),
+                "voted_count": len(touched),
+            })
+
+    # --- Phase 2: refine — money-first zip to full adjacent coverage ---
     # Re-derive the ranking from scratch before every step.  A comparison at
     # position k can shift rank_centrality scores so that a brand-new,
-    # never-compared pair appears at position k-1; the old pass-based loop
-    # would skip back to catch it only on the next full pass, re-comparing
-    # already-settled pairs along the way.
+    # never-compared pair appears at position k-1; re-deriving means it is
+    # caught immediately instead of on a later pass.
     #
-    # Termination: every adjacent slot in the current ranking is occupied by
-    # a pair that already has at least one direct comparison result.
-    # There is exactly one logical pass; step is how far down the ranking we
-    # had to scan to find the first uncovered adjacent pair (1 = top of zip).
+    # Cross-author adjacent pairs are compared first: a same-author
+    # inversion leaves every contributor's payout unchanged, so its
+    # information is nearly worthless per token spent. Same-author pairs
+    # are compared only when no cross-author pair remains, which preserves
+    # the terminal certificate: every adjacent slot in the final ranking
+    # has at least one direct LLM-reasoned comparison ("fully zipped").
+    # No pair is ever compared more than once.
     while True:
         scores = await asyncio.to_thread(rank_centrality, pairs)
         ranking = sorted(range(n), key=lambda idx: scores[idx], reverse=True)
 
         target = None
+        same_author_fallback = None
         for pos in range(n - 1):
             a, b = ranking[pos], ranking[pos + 1]
-            if frozenset((a, b)) not in compared:
+            if frozenset((a, b)) in compared:
+                continue
+            if authors is None or authors[a] != authors[b]:
                 target = (pos, a, b)
                 break
+            if same_author_fallback is None:
+                same_author_fallback = (pos, a, b)
+        if target is None:
+            target = same_author_fallback
 
         if target is None:
             if progress_fn:
@@ -1298,7 +1400,7 @@ async def pairwise_rank(n: int, compare_fn, progress_fn=None) -> list:
                     "voted_count": n,
                     "complete": True,
                 })
-            break  # every adjacent edge has at least one LLM-reasoned result
+            break  # fully zipped: every adjacent edge has a direct result
 
         pos, a, b = target
         await compare(a, b)
@@ -2283,6 +2385,10 @@ def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
     return None
 
 
+def _comparison_has_judgments(comparison_id: str) -> bool:
+    return ROOT.judgment_ids_by_comparison.key(comparison_id).len(_db()) > 0
+
+
 def _find_ranking_models(ranking_run_id: str) -> list[str] | None:
     event_ = find_evidence_payload(
         "ranking.started", "ranking_run_id", ranking_run_id
@@ -2420,12 +2526,9 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
     retired_models: set[str] = set()
     models_that_voted: set[str] = set()
 
-    async def compare_fn(i, j):
-        side_a, side_b = sides[i], sides[j]
-        label_a = f"{side_a['commit_id'][:16]} ({side_a['contributor']})"
-        label_b = f"{side_b['commit_id'][:16]} ({side_b['contributor']})"
-        prompt = build_pairwise_prompt(side_a, side_b)
-        comparison_material = {
+    def _material_for(x, y):
+        side_a, side_b = sides[x], sides[y]
+        material = {
             "ranking_run_id": ranking_run_id,
             "side_a": {
                 "contributor": side_a["contributor"],
@@ -2443,9 +2546,42 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
                 "message": _bytes_blob(side_b["message"]),
                 "diff": _bytes_blob(side_b["diff"]),
             },
-            "prompt": _bytes_blob(prompt),
+            "prompt": _bytes_blob(build_pairwise_prompt(side_a, side_b)),
         }
-        comparison_id = comparison_id_for(comparison_material)
+        return material, comparison_id_for(material)
+
+    def _oriented_indices(i, j):
+        """Deterministic presentation order for a pair.
+
+        The refine phase proposes the currently-higher-ranked commit
+        first; jurors carry measured position bias (epoch 3: one model
+        chose side A 61.6% of the time, another 43.0%, on the same
+        comparisons), so ranking-coupled presentation entrenches or
+        churns the standing order. A hash coin on the oid pair breaks
+        that coupling while staying stable across restarts.
+        """
+        a, b = (i, j) if sides[i]["oid"] <= sides[j]["oid"] else (j, i)
+        digest = _sha256_hex(
+            f"side-order|{sides[a]['oid']}|{sides[b]['oid']}".encode()
+        )
+        if int(digest[0], 16) % 2:
+            a, b = b, a
+        return a, b
+
+    async def compare_fn(i, j):
+        i, j = _oriented_indices(i, j)
+        comparison_material, comparison_id = _material_for(i, j)
+        if not _comparison_has_judgments(comparison_id):
+            # Pairs first judged before deterministic orientation existed
+            # may live under the swapped presentation; reuse them rather
+            # than re-buying the same comparison.
+            swapped_material, swapped_id = _material_for(j, i)
+            if _comparison_has_judgments(swapped_id):
+                i, j = j, i
+                comparison_material, comparison_id = swapped_material, swapped_id
+        side_a, side_b = sides[i], sides[j]
+        label_a = f"{side_a['commit_id'][:16]} ({side_a['contributor']})"
+        label_b = f"{side_b['commit_id'][:16]} ({side_b['contributor']})"
         comparison_material = {
             **comparison_material,
             "comparison_id": comparison_id,
@@ -2584,7 +2720,16 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             ["div#emission-status", label]
         ]))
 
-    pairs = await pairwise_rank(len(ordered), compare_fn, progress_fn)
+    pairs = await pairwise_rank(
+        len(ordered),
+        compare_fn,
+        progress_fn,
+        # Cross-author adjacent pairs first: same-author order can't move
+        # the payout. Seeding by ranking_run_id keeps explore matchings
+        # identical across restarts so cached judgments are reused.
+        authors=[row["contributor"] for row in ordered],
+        seed=ranking_run_id,
+    )
 
     if not pairs:
         commit_score_list = [Decimal("1")]
