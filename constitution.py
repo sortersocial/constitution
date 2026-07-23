@@ -212,6 +212,9 @@ PREFERRED_COUNCIL_MODELS = json.loads(
         json.dumps(DEFAULT_PREFERRED_COUNCIL_MODELS),
     )
 )
+# Council votes per comparison edge, clamped to the council size at runtime.
+# Lower values spend proportionally fewer tokens per epoch; 1 is the floor.
+COUNCIL_VOTES_PER_EDGE = max(1, int(os.environ.get("COUNCIL_VOTES_PER_EDGE", "3")))
 
 
 # ===========================================================================
@@ -2273,6 +2276,20 @@ def _rollup_contributor_scores(
     return totals
 
 
+def _edge_jurors(comparison_id: str, models: list[str]) -> list[str]:
+    """Deterministic per-edge juror rotation.
+
+    Hash-ordering seats different jurors on different edges when
+    COUNCIL_VOTES_PER_EDGE is below the council size, so no single model
+    monopolizes the ranking. The order is stable across restarts because
+    comparison ids are content-addressed.
+    """
+    return sorted(
+        models,
+        key=lambda model: _sha256_hex(f"{comparison_id}|{model}".encode()),
+    )
+
+
 def _find_judgment(comparison_id: str, model_id: str) -> dict | None:
     path = ROOT.judgment_ids_by_comparison.key(comparison_id)
     ids = path.iter(_db()) if path.len(_db()) else []
@@ -2392,14 +2409,16 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
         phase="spanning_tree",
     )
     await broadcast_ranking_state()
+    votes_per_edge = min(COUNCIL_VOTES_PER_EDGE, len(models))
     await append_evidence(epoch, "ranking.started", {
         "ranking_run_id": ranking_run_id,
         "commit_ids": commit_ids,
         "contributors": contributors,
         "models": models,
+        "votes_per_edge": votes_per_edge,
         "summary": (
             f"Council selected: {', '.join(models)} — "
-            f"{len(ordered)} commits"
+            f"{len(ordered)} commits, {votes_per_edge} vote(s) per comparison"
         ),
     })
     await broadcast_audit(
@@ -2473,7 +2492,14 @@ async def rank_commits(commits: list[dict], *, epoch: int = -1):
             ["div#emission-status", f"Comparing {label_a} vs {label_b}…"]
         ]))
         results = []
-        for model in models:
+        # Deterministic per-edge rotation seats jurors; models with a cached
+        # judgment claim their seat first because a cached vote is free, so a
+        # resumed run never pays for a comparison that already has enough votes.
+        rotation = _edge_jurors(comparison_id, models)
+        rotation.sort(key=lambda m: _find_judgment(comparison_id, m) is None)
+        for model in rotation:
+            if len(results) >= votes_per_edge:
+                break
             if model in retired_models:
                 continue
             try:
