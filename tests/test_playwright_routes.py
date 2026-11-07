@@ -76,7 +76,12 @@ def base_url():
 @pytest.fixture(scope="module")
 def browser():
     with sync_playwright() as p:
-        b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            b = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        except Exception as e:
+            if "Executable doesn't exist" in str(e):
+                pytest.skip("Playwright browsers not installed (run: uv run python -m playwright install chromium)")
+            raise
         yield b
         b.close()
 
