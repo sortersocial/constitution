@@ -17,6 +17,7 @@ dependencies = [
     "sympy",
     "authlib",
     "python-multipart",
+    "playwright>=1.64.1",
 ]
 
 [tool.pytest.ini_options]
